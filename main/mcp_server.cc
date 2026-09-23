@@ -115,6 +115,211 @@ void McpServer::AddCommonTools() {
     }
 #endif
 
+#ifdef CONFIG_ENABLE_SILVER_ECONOMY_DEMO
+    // ========================================================================
+    // 银发经济演示工具（学习示例）
+    // ------------------------------------------------------------------
+    // 注意：按 mcp_server.cc:36-37 注释的规则，自定义工具应在板子的
+    // InitializeTools() 中注册，不应放在这里。此区块仅作学习演示，
+    // 通过 Kconfig 选项 CONFIG_ENABLE_SILVER_ECONOMY_DEMO 控制启用。
+    // 烧入设备前请迁移到 boards/<your_board>/<board>.cc 的 InitializeTools()。
+    // ========================================================================
+
+    // 工具 1：服药提醒管理
+    // 思路：NVS Settings 没有遍历 API，所以用一个 summary key "reminders"
+    //       存所有提醒的 JSON 数组字符串，list/add/remove 都直接重写整个数组。
+    AddTool("self.medication_reminder",
+            "管理老人的服药提醒。支持添加、删除、查询当前所有提醒。\n"
+            "Args:\n"
+            "  action: 'add' | 'remove' | 'list'\n"
+            "  medicine: 药名（add 时必填）\n"
+            "  time: 'HH:MM' 24 小时制（add/remove 时必填）\n"
+            "Return:\n"
+            "  list 返回 [{time, medicine}, ...]；add/remove 返回更新后的列表。",
+            PropertyList({
+                Property("action", kPropertyTypeString),
+                Property("medicine", kPropertyTypeString, std::string("")),
+                Property("time", kPropertyTypeString, std::string("")),
+            }),
+            [this](const PropertyList& properties) -> ToolResult {
+                auto action = properties["action"].value<std::string>();
+                auto medicine = properties["medicine"].value<std::string>();
+                auto time = properties["time"].value<std::string>();
+
+                // 用 Settings 把所有提醒整体存为 JSON 字符串
+                Settings settings("medication", true);
+                std::string stored = settings.GetString("reminders", "[]");
+
+                cJSON* root = cJSON_Parse(stored.c_str());
+                if (root == nullptr || !cJSON_IsArray(root)) {
+                    if (root) cJSON_Delete(root);
+                    root = cJSON_CreateArray();
+                }
+
+                if (action == "add") {
+                    if (time.empty() || medicine.empty()) {
+                        cJSON_Delete(root);
+                        return std::unexpected("medicine and time are required for 'add'");
+                    }
+                    cJSON* item = cJSON_CreateObject();
+                    cJSON_AddStringToObject(item, "time", time.c_str());
+                    cJSON_AddStringToObject(item, "medicine", medicine.c_str());
+                    cJSON_AddItemToArray(root, item);
+                } else if (action == "remove") {
+                    if (time.empty()) {
+                        cJSON_Delete(root);
+                        return std::unexpected("time is required for 'remove'");
+                    }
+                    cJSON* new_arr = cJSON_CreateArray();
+                    cJSON* elem = nullptr;
+                    cJSON_ArrayForEach(elem, root) {
+                        cJSON* t = cJSON_GetObjectItem(elem, "time");
+                        if (t == nullptr || !cJSON_IsString(t) ||
+                            strcmp(t->valuestring, time.c_str()) != 0) {
+                            // 不匹配则保留
+                            cJSON_AddItemReferenceToArray(new_arr, elem);
+                        }
+                    }
+                    cJSON_Delete(root);
+                    root = new_arr;
+                } else if (action != "list") {
+                    cJSON_Delete(root);
+                    return std::unexpected("Unknown action: " + action);
+                }
+
+                // 非 list 操作写回 NVS
+                if (action != "list") {
+                    char* out = cJSON_PrintUnformatted(root);
+                    settings.SetString("reminders", out);
+                    free(out);
+                }
+                return root;  // 返回 cJSON*，框架会负责释放
+            });
+
+    // 工具 2：跌倒检测（按需拍照分析）
+    // 思路：暴露一个 AI 可调用的 check_once 工具。AI 根据对话上下文
+    //       （比如老人喊"我摔倒了"或家属远程询问）触发一次拍照+云端视觉分析。
+    //       真正的"主动周期检测"应另起 esp_timer 任务，不放在 MCP 工具里。
+    AddTool("self.fall_detection",
+            "拍照并调用云端视觉模型判断画面中是否有人呈跌倒姿态。\n"
+            "用于跌倒检测场景。返回 JSON {fell, confidence, description}。\n"
+            "若 fell=true，调用方应立即通知家属或拨打 120。",
+            PropertyList(),
+            [this](const PropertyList& properties) -> ToolResult {
+                auto camera = Board::GetInstance().GetCamera();
+                if (camera == nullptr) {
+                    return std::unexpected("Camera not available on this board");
+                }
+                // 降低任务优先级，避免摄像头采集阻塞音频/网络任务
+                TaskPriorityReset priority_reset(1);
+                if (!camera->Capture()) {
+                    return std::unexpected("Failed to capture photo");
+                }
+                // 复用 camera->Explain() 接口，提示词约定 JSON 输出格式
+                std::string prompt =
+                    "观察画面中是否有人呈跌倒或瘫坐姿态。"
+                    "返回 JSON：{\"fell\": bool, \"confidence\": 0.0-1.0, "
+                    "\"description\": 简短描述}";
+                auto result = camera->Explain(prompt);
+                if (!result) {
+                    return std::unexpected(std::move(result.error()));
+                }
+                return std::move(*result);
+            });
+
+    // 工具 3：家属留言板（文字版）
+    // 思路：家属通过云端 MCP 调用 add_message 推送文字留言，
+    //       设备存到 NVS（避开音频文件解码的复杂性）。
+    //       老人按键时通过协议让云端 TTS 念最新一条。
+    //       真实音频留言版需扩展协议 + SPIFFS + Opus 解码，留作 TODO。
+    AddTool("self.family_voice_board",
+            "家属留言板。家属可远程为老人添加文字留言，老人按键时设备会朗读。\n"
+            "Args:\n"
+            "  action: 'add' | 'list' | 'play_latest'\n"
+            "  sender: 留言人姓名（add 时必填）\n"
+            "  message: 留言内容（add 时必填）\n"
+            "Return:\n"
+            "  list 返回 [{sender, message, time}, ...]；\n"
+            "  play_latest 返回最新留言文本，调用方应通过 TTS 播报。",
+            PropertyList({
+                Property("action", kPropertyTypeString),
+                Property("sender", kPropertyTypeString, std::string("")),
+                Property("message", kPropertyTypeString, std::string("")),
+            }),
+            [this](const PropertyList& properties) -> ToolResult {
+                auto action = properties["action"].value<std::string>();
+                auto sender = properties["sender"].value<std::string>();
+                auto message = properties["message"].value<std::string>();
+
+                Settings settings("voice_board", true);
+                std::string stored = settings.GetString("messages", "[]");
+
+                cJSON* root = cJSON_Parse(stored.c_str());
+                if (root == nullptr || !cJSON_IsArray(root)) {
+                    if (root) cJSON_Delete(root);
+                    root = cJSON_CreateArray();
+                }
+
+                if (action == "add") {
+                    if (sender.empty() || message.empty()) {
+                        cJSON_Delete(root);
+                        return std::unexpected("sender and message are required for 'add'");
+                    }
+                    // 用系统时间生成时间戳；如果没有同步过服务器时间，
+                    // 使用 clock_ticks *tick 作为 fallback（粗略）。
+                    time_t now = time(nullptr);
+                    char time_buf[32] = {0};
+                    if (now > 1700000000) {  // 2023 年之后才算有效
+                        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M",
+                                 localtime(&now));
+                    } else {
+                        snprintf(time_buf, sizeof(time_buf), "tick");
+                    }
+                    cJSON* item = cJSON_CreateObject();
+                    cJSON_AddStringToObject(item, "sender", sender.c_str());
+                    cJSON_AddStringToObject(item, "message", message.c_str());
+                    cJSON_AddStringToObject(item, "time", time_buf);
+                    cJSON_AddItemToArray(root, item);
+                    char* out = cJSON_PrintUnformatted(root);
+                    settings.SetString("messages", out);
+                    free(out);
+                    return root;
+                }
+
+                if (action == "list") {
+                    return root;
+                }
+
+                if (action == "play_latest") {
+                    int count = cJSON_GetArraySize(root);
+                    if (count == 0) {
+                        cJSON_Delete(root);
+                        return std::unexpected("No messages yet");
+                    }
+                    cJSON* last = cJSON_GetArrayItem(root, count - 1);
+                    cJSON* msg = cJSON_GetObjectItem(last, "message");
+                    cJSON* sdr = cJSON_GetObjectItem(last, "sender");
+                    std::string text = "来自 ";
+                    text += (sdr && cJSON_IsString(sdr)) ? sdr->valuestring : "家人";
+                    text += " 的留言：";
+                    text += (msg && cJSON_IsString(msg)) ? msg->valuestring : "";
+                    cJSON_Delete(root);
+                    // 调用方（云端 LLM）拿到这段文本后会用 TTS 念给老人听
+                    return text;
+                }
+
+                cJSON_Delete(root);
+                return std::unexpected("Unknown action: " + action);
+            });
+
+    // TODO：为 family_voice_board 实现真实音频版：
+    //   1. 扩展 websocket/mqtt 协议，新增 "voice_board_push" 消息类型
+    //      携带 base64 编码的 Opus 音频
+    //   2. 设备解码后存入 SPIFFS（/spiffs/voice_board/<n>.opus）
+    //   3. 老人按 SOS 按钮 → audio_service_.PlayLocalFile(path)
+    //   4. 需要在 audio_service.cc 新增 PlayLocalFile 接口
+#endif  // CONFIG_ENABLE_SILVER_ECONOMY_DEMO
+
     // Restore the original tools list to the end of the tools list
     tools_.insert(tools_.end(), std::make_move_iterator(original_tools.begin()),
                   std::make_move_iterator(original_tools.end()));

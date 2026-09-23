@@ -1116,7 +1116,7 @@ endmenu
 
 menu "TAIJIPAI_S3_CONFIG"
     depends on BOARD_TYPE_TAIJI_PI_S3
-    choice I2S_TYPE_TAIJIPI_S3
+    choice I2S_TYPE_TAIJIPAI_S3
         prompt "taiji-pi-S3 I2S Type"
         default TAIJIPAI_I2S_TYPE_STD
         help
@@ -1132,6 +1132,102 @@ menu "TAIJIPAI_S3_CONFIG"
     default y
     help
         启动双声道
+endmenu
+
+menu "Silver Economy Demo"
+    comment "学习示例：银发经济 MCP 工具（学习用，正式版在板子 InitializeTools 中）"
+
+    config ENABLE_SILVER_ECONOMY_DEMO
+        bool "Enable Silver Economy MCP Demo Tools (Learning Only)"
+        default n
+        help
+            启用 mcp_server.cc 中带详细注释的银发经济学习版工具
+            （self.medication_reminder / self.fall_detection / self.family_voice_board）。
+
+            注意：
+            1. 仅作学习用途。按 AGENTS.md 规则，自定义工具应在板子的
+               InitializeTools() 中注册。
+            2. 启用后，板子代码中同名的正式版工具会被框架跳过
+               （日志输出 "Tool xxx already added"），属预期行为。
+            3. 正式构建请保持默认关闭 (n)，依赖板子代码即可。
+
+    config ENABLE_BOARD_FALL_DETECTION
+        bool "Enable Periodic Fall Detection (Board, Always-On)"
+        default n
+        depends on BOARD_TYPE_BREAD_COMPACT_WIFI_CAM
+        help
+            在板子代码中启用 esp_timer 周期跌倒检测任务。
+            与 AI 按需调用的 self.fall_detection 工具互补：
+            - 工具：AI 在对话上下文里主动调用一次
+            - 周期任务：每 N 秒自动后台拍照+云端分析
+
+            注意：
+            1. 启用后会持续占用摄像头和云端视觉额度，存在隐私/流量成本。
+            2. 需要板子已联网，否则 Explain 调用会失败。
+            3. 默认关闭，仅在用户明确需要"无人值守监护"时打开。
+
+    config BOARD_FALL_DETECTION_PERIOD_MS
+        int "Fall Detection Periodic Check Interval (ms)"
+        default 60000
+        range 30000 3600000
+        depends on ENABLE_BOARD_FALL_DETECTION
+        help
+            跌倒检测后台周期任务的触发间隔，单位毫秒。
+            推荐值：30000~60000（30~60 秒）。
+
+    config ENABLE_SCHEDULE_REMINDER
+        bool "Enable Scheduled Reminder Announcement (Board)"
+        default n
+        depends on BOARD_TYPE_BREAD_COMPACT_WIFI_CAM
+        help
+            启用后台定时任务，每分钟检查 NVS 中存储的日程提醒。
+            到点后自动在屏幕弹出提醒并播放提示音。
+            配合 self.schedule_reminder 工具使用（工具负责增删查，
+            本开关负责到点播报）。
+
+    config ENABLE_SEDENTARY_REMINDER
+        bool "Enable Sedentary / Inactivity Reminder (Board)"
+        default n
+        depends on BOARD_TYPE_BREAD_COMPACT_WIFI_CAM
+        help
+            启用后台久坐提醒。每隔设定时间检测画面中是否有人持续
+            保持同一姿态（或无人活动），若是则语音提醒老人起身活动。
+            依赖摄像头，会持续占用云端视觉额度。
+
+    config SEDENTARY_REMINDER_PERIOD_MS
+        int "Sedentary Reminder Check Interval (ms)"
+        default 1800000
+        range 600000 7200000
+        depends on ENABLE_SEDENTARY_REMINDER
+        help
+            久坐提醒检测间隔，单位毫秒。默认 1800000（30 分钟）。
+
+    config ENABLE_BED_EXIT_DETECTION
+        bool "Enable Night Bed-Exit Detection (Board)"
+        default n
+        depends on BOARD_TYPE_BREAD_COMPACT_WIFI_CAM
+        help
+            启用夜间离床检测。摄像头对准床铺，定时拍照分析：
+            - 若床上无人且持续超过设定时间，判定为离床未归
+            - 触发跌倒/走失告警并通知家属
+            适用于夜间看护场景，依赖摄像头。
+
+    config BED_EXIT_CHECK_PERIOD_MS
+        int "Bed-Exit Detection Check Interval (ms)"
+        default 120000
+        range 30000 600000
+        depends on ENABLE_BED_EXIT_DETECTION
+        help
+            离床检测拍照分析间隔，单位毫秒。默认 120000（2 分钟）。
+
+    config BED_EXIT_EMPTY_TIMEOUT_S
+        int "Bed Empty Timeout Before Alert (seconds)"
+        default 600
+        range 60 3600
+        depends on ENABLE_BED_EXIT_DETECTION
+        help
+            床上连续无人超过该秒数后触发告警。默认 600（10 分钟）。
+
 endmenu
 
 endmenu

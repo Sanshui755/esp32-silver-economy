@@ -305,4 +305,17 @@
 // A MCP Test: Control a lamp
 #define LAMP_GPIO GPIO_NUM_14
 
+// 银发经济：SOS 紧急按键
+// 接线：按键一端接 GPIO3，另一端接 GND（内部上拉，按下为低电平）
+//
+// ESP32-S3 (N16R8) 引脚约束——选脚前必读：
+//   22-25  : 芯片上不存在（编号跳过），绝对不能用
+//   26-32  : 连接内部 16MB SPI Flash，禁用
+//   33/34  : 可用（备选）；35-37 被 Octal PSRAM 占用，N16R8 禁用
+//   43/44  : UART0 调试串口，占用后无法查看日志
+//   其余 0-21、38-42、45-48 已全部被本板占用（音频/摄像头/屏/灯/LED）
+//   GPIO3 是唯一空闲的常规 GPIO；strapping 脚（JTAG 源选择），
+//   上电时被内部上拉为高，按键不按下不影响启动。
+#define SOS_BUTTON_GPIO GPIO_NUM_3
+
 #endif // _BOARD_CONFIG_H_
