@@ -269,7 +269,9 @@ private:
         // 工具 1：服药提醒管理
         mcp.AddTool(
             "self.medication_reminder",
-            "管理老人的服药提醒。支持添加、删除、查询当前所有提醒。\n"
+            "管理老人的服药提醒闹钟（添加/删除/查询提醒时间点）。\n"
+            "仅用于设置和查看'几点该吃什么药'的提醒计划，不回答用药咨询问题\n"
+            "（如漏服处理、药物相互作用、饭前饭后等），此类问题请直接回答。\n"
             "Args:\n"
             "  action: 'add' | 'remove' | 'list'\n"
             "  medicine: 药名（add 时必填）\n"
@@ -337,7 +339,8 @@ private:
         mcp.AddTool(
             "self.fall_detection",
             "拍照并调用云端视觉模型判断画面中是否有人呈跌倒姿态。\n"
-            "用于跌倒检测场景。返回 JSON {fell, confidence, description}。",
+            "用于实时检测，不回答跌倒预防/急救知识问题（此类问题请直接回答）。\n"
+            "返回 JSON {fell, confidence, description}。",
             PropertyList(),
             [this](const PropertyList& properties) -> ToolResult {
                 auto camera = Board::GetInstance().GetCamera();
@@ -449,7 +452,10 @@ private:
         // 工具 4：用药打卡记录
         mcp.AddTool(
             "self.medication_log",
-            "记录老人是否已按时服药。与 self.medication_reminder 配合使用。\n"
+            "记录和查询老人今天是否已服药（打卡功能）。\n"
+            "仅用于 checkin（老人说'我吃过药了'）和 status（查'今天药吃了没'），\n"
+            "不回答用药咨询问题（如漏服处理、药物禁忌、何时补服等），\n"
+            "此类问题请直接回答，不要调用本工具。\n"
             "Args:\n"
             "  action: 'checkin' | 'status' | 'list_today'\n"
             "  medicine: 药名（checkin 时必填）\n"
@@ -808,7 +814,8 @@ private:
         // 工具 9：天气查询
         mcp.AddTool(
             "self.weather_query",
-            "查询当前天气。\n"
+            "查询当前实时天气数据（温度、天气状况）。\n"
+            "仅返回天气数据，不回答穿衣建议或健康指导（此类问题请直接回答）。\n"
             "Args:\n"
             "  city: 城市名（可选，默认自动定位）\n"
             "Return:\n"
