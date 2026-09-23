@@ -99,14 +99,20 @@ void McpServer::AddCommonTools() {
                 "  A JSON object that provides the photo information.",
                 PropertyList({Property("question", kPropertyTypeString)}),
                 [camera](const PropertyList& properties) -> ToolResult {
+                    // Acquire camera lock to prevent concurrent access with periodic vision tasks
+                    if (!camera->TryLock()) {
+                        return std::unexpected("Camera is busy, please try again in a few seconds");
+                    }
                     // Lower the priority to do the camera capture
                     TaskPriorityReset priority_reset(1);
 
                     if (!camera->Capture()) {
+                        camera->Unlock();
                         return std::unexpected("Failed to capture photo");
                     }
                     auto question = properties["question"].value<std::string>();
                     auto result = camera->Explain(question);
+                    camera->Unlock();
                     if (!result) {
                         return std::unexpected(std::move(result.error()));
                     }

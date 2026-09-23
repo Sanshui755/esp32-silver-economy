@@ -3,6 +3,7 @@
 
 #include <lvgl.h>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -28,6 +29,7 @@ private:
     camera_fb_t* current_fb_ = nullptr;
     uint8_t* encode_buf_ = nullptr;  // Buffer for JPEG encoding (with optional byte swap)
     size_t encode_buf_size_ = 0;
+    std::recursive_mutex camera_mutex_;  // Protects current_fb_ and encoder_thread_ from concurrent access
 
 public:
     Esp32Camera(const camera_config_t& config);
@@ -39,4 +41,6 @@ public:
     virtual bool SetVFlip(bool enabled) override;
     virtual bool SetSwapBytes(bool enabled) override;
     virtual std::expected<std::string, std::string> Explain(const std::string& question) override;
+    virtual bool TryLock() override;
+    virtual void Unlock() override;
 };

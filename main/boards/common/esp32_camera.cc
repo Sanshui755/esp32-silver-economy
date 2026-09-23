@@ -73,6 +73,14 @@ void Esp32Camera::SetExplainUrl(const std::string& url, const std::string& token
     explain_token_ = token;
 }
 
+bool Esp32Camera::TryLock() {
+    return camera_mutex_.try_lock();
+}
+
+void Esp32Camera::Unlock() {
+    camera_mutex_.unlock();
+}
+
 bool Esp32Camera::Capture() {
     if (encoder_thread_.joinable()) {
         encoder_thread_.join();

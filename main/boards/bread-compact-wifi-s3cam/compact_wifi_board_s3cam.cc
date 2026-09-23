@@ -101,19 +101,16 @@ private:
     Esp32Camera* camera_;
 
     // ==================================================================
-    // 视觉互斥锁：摄像头（current_fb_/encoder_thread_ 是共享成员且无锁）
-    // 同一时刻只允许一个视觉调用（3 个 MCP 工具 + 3 个周期任务）使用，
-    // 避免并发导致 frame buffer 被归还、拍照超时等数据竞争问题。
+    // 视觉互斥锁：通过 Camera::TryLock/Unlock 实现跨模块互斥，
+    // 确保内置 take_photo、板级 MCP 工具、周期任务不会并发访问摄像头。
     // ==================================================================
-    std::atomic<bool> vision_busy_{false};
-    struct VisionGuard {
-        std::atomic<bool>& flag;
+    struct CameraLockGuard {
+        Camera* cam;
         bool held;
-        explicit VisionGuard(std::atomic<bool>& f) : flag(f) {
-            bool expected = false;
-            held = f.compare_exchange_strong(expected, true);
+        explicit CameraLockGuard(Camera* c) : cam(c) {
+            held = c ? c->TryLock() : false;
         }
-        ~VisionGuard() { if (held) flag.store(false); }
+        ~CameraLockGuard() { if (held) cam->Unlock(); }
         bool Held() const { return held; }
     };
 
@@ -348,7 +345,7 @@ private:
                     return std::unexpected("Camera not available on this board");
                 }
                 // 视觉互斥：周期跌倒检测任务可能正在用摄像头
-                VisionGuard guard(vision_busy_);
+                CameraLockGuard guard(camera);
                 if (!guard.Held()) {
                     ESP_LOGW(TAG, "fall_detection tool: camera busy");
                     return std::unexpected("Camera is busy, please try again in a few seconds");
@@ -722,7 +719,7 @@ private:
                     return std::unexpected("Camera not available on this board");
                 }
                 // 视觉互斥：周期检测任务可能正在用摄像头
-                VisionGuard guard(vision_busy_);
+                CameraLockGuard guard(camera);
                 if (!guard.Held()) {
                     ESP_LOGW(TAG, "find_item: camera busy");
                     return std::unexpected("Camera is busy, please try again in a few seconds");
@@ -774,7 +771,7 @@ private:
                     return std::unexpected("Camera not available on this board");
                 }
                 // 视觉互斥：周期检测任务可能正在用摄像头
-                VisionGuard guard(vision_busy_);
+                CameraLockGuard guard(camera);
                 if (!guard.Held()) {
                     ESP_LOGW(TAG, "door_identification: camera busy");
                     return std::unexpected("Camera is busy, please try again in a few seconds");
@@ -915,7 +912,7 @@ private:
         }
 
         // 视觉互斥：手动视觉工具（find_item 等）可能正在用摄像头，跳过本轮
-        VisionGuard guard(vision_busy_);
+        CameraLockGuard guard(camera_);
         if (!guard.Held()) {
             ESP_LOGI(TAG, "fall_detection: camera busy, skip this round");
             return;
@@ -1140,7 +1137,7 @@ private:
             return;
         }
         // 视觉互斥：手动视觉工具可能正在用摄像头，跳过本轮
-        VisionGuard guard(vision_busy_);
+        CameraLockGuard guard(camera_);
         if (!guard.Held()) {
             ESP_LOGI(TAG, "sedentary: camera busy, skip this round");
             return;
@@ -1253,7 +1250,7 @@ private:
             return;
         }
         // 视觉互斥：手动视觉工具可能正在用摄像头，跳过本轮
-        VisionGuard guard(vision_busy_);
+        CameraLockGuard guard(camera_);
         if (!guard.Held()) {
             ESP_LOGI(TAG, "bed_exit: camera busy, skip this round");
             return;
