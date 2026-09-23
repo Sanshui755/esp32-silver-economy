@@ -755,9 +755,16 @@ private:
             });
 
         // 工具 5：通用日程提醒
+#if !defined(CONFIG_ENABLE_SCHEDULE_REMINDER)
+#pragma message("self.schedule_reminder: ENABLE_SCHEDULE_REMINDER is OFF, reminders will be stored but NEVER fire")
+#endif
         mcp.AddTool(
             "self.schedule_reminder",
             "管理老人的日程提醒（不止吃药，如看病、交水费、生日等）。\n"
+#if !defined(CONFIG_ENABLE_SCHEDULE_REMINDER)
+            "【警告】当前固件未开启日程播报后台任务（ENABLE_SCHEDULE_REMINDER），"
+            "提醒只能保存、到点不会弹屏或响铃，必须明确告知用户这一限制。\n"
+#endif
             "Args:\n"
             "  action: 'add' | 'remove' | 'list'\n"
             "  time: 'HH:MM' 24 小时制（add/remove 必填）\n"
@@ -788,6 +795,14 @@ private:
                         cJSON_Delete(root);
                         return std::unexpected("time and content are required for 'add'");
                     }
+#if !defined(CONFIG_ENABLE_SCHEDULE_REMINDER)
+                    // 播报任务未编译进固件：存了也不会响，直接报错让 AI 告知用户
+                    cJSON_Delete(root);
+                    return std::unexpected(
+                        "日程播报后台任务未启用（menuconfig 中 ENABLE_SCHEDULE_REMINDER 未开启），"
+                        "提醒到点不会弹屏或响铃。请先在 SDK Configuration Editor 勾选 "
+                        "Enable Scheduled Reminder Announcement 并重新编译烧录固件，再设置日程提醒。");
+#endif
                     cJSON* item = cJSON_CreateObject();
                     cJSON_AddStringToObject(item, "time", time.c_str());
                     cJSON_AddStringToObject(item, "content", content.c_str());
@@ -1982,6 +1997,9 @@ public:
 #endif
 #ifdef CONFIG_ENABLE_SCHEDULE_REMINDER
         StartScheduleReminder();
+#else
+        ESP_LOGW(TAG, "schedule_reminder: ENABLE_SCHEDULE_REMINDER is OFF, "
+                      "saved reminders will NOT fire");
 #endif
 #ifdef CONFIG_ENABLE_MEDICATION_REMINDER_TASK
         StartMedicationReminder();
