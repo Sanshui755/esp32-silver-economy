@@ -1137,20 +1137,6 @@ endmenu
 menu "Silver Economy Demo"
     comment "学习示例：银发经济 MCP 工具（学习用，正式版在板子 InitializeTools 中）"
 
-    config ENABLE_SILVER_ECONOMY_DEMO
-        bool "Enable Silver Economy MCP Demo Tools (Learning Only)"
-        default n
-        help
-            启用 mcp_server.cc 中带详细注释的银发经济学习版工具
-            （self.medication_reminder / self.fall_detection / self.family_voice_board）。
-
-            注意：
-            1. 仅作学习用途。按 AGENTS.md 规则，自定义工具应在板子的
-               InitializeTools() 中注册。
-            2. 启用后，板子代码中同名的正式版工具会被框架跳过
-               （日志输出 "Tool xxx already added"），属预期行为。
-            3. 正式构建请保持默认关闭 (n)，依赖板子代码即可。
-
     config ENABLE_BOARD_FALL_DETECTION
         bool "Enable Periodic Fall Detection (Board, Always-On)"
         default n

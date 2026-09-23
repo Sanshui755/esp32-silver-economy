@@ -12,33 +12,21 @@
 | 4   | `self.screen.set_theme`         | 切换屏幕主题                    | 有显示屏时 |
 | 5   | `self.camera.take_photo`        | 拍照                            | 有摄像头时 |
 
-## 二、银发经济工具 — 学习版（mcp_server.cc，Kconfig 开关）
+## 二、银发经济工具（板级代码）
 
-注册位置：`main/mcp_server.cc`，受 `CONFIG_ENABLE_SILVER_ECONOMY_DEMO` 控制。
-
-正式版在板级代码注册同名工具后，框架会自动跳过学习版（日志输出 "Tool xxx already added"），属预期行为。
-
-| #   | 工具名                     | 功能                  | 参数                | 存储              |
-| --- | -------------------------- | --------------------- | ------------------- | ----------------- |
-| 6   | `self.medication_reminder` | 服药提醒增删查        | add / remove / list | NVS `medication`  |
-| 7   | `self.fall_detection`      | 拍照+视觉分析是否跌倒 | 无                  | 无状态            |
-| 8   | `self.family_voice_board`  | 家属留言板（文字）    | add / list          | NVS `voice_board` |
-
-## 三、银发经济工具 — 正式版（板级代码）
-
-注册位置：`main/boards/bread-compact-wifi-s3cam/compact_wifi_board_s3cam.cc` 的 `InitializeTools()` 中。
+注册位置：`main/boards/bread-compact-wifi-s3cam/compact_wifi_board_s3cam.cc` 的 `InitializeTools()` 中。所有工具按 AGENTS.md 规范在板级注册，不放在 mcp_server.cc。
 
 | #   | 工具名                     | 功能                  | 参数                          | 存储                     | 说明                                   |
 | --- | -------------------------- | --------------------- | ----------------------------- | ------------------------ | -------------------------------------- |
-| 9   | `self.medication_reminder` | 服药提醒增删查        | add / remove / list           | NVS `medication`         | 正式版，与学习版同名                   |
-| 10  | `self.fall_detection`      | 拍照+视觉分析是否跌倒 | 无                            | 无状态                   | 返回 `{fell, confidence, description}` |
-| 11  | `self.family_voice_board`  | 家属留言板（文字）    | add / list                    | NVS `voice_board`        |                                        |
-| 12  | `self.medication_log`      | 用药打卡记录          | checkin / status / list_today | NVS `medication`         | 与服药提醒配合，形成闭环               |
-| 13  | `self.schedule_reminder`   | 通用日程提醒          | add / remove / list           | NVS `reminders`          | 到点自动播报（需开 Kconfig）           |
-| 14  | `self.emergency_contact`   | 紧急联系人管理        | add / remove / list           | NVS `emergency_contacts` | SOS 触发时自动显示                     |
-| 15  | `self.find_item`           | 找东西（拍照+视觉）   | item_name                     | 无状态                   | 受 VisionGuard 互斥锁保护              |
-| 16  | `self.door_identification` | 门口来人识别          | 无                            | 无状态                   | 防诈骗，同上互斥锁                     |
-| 17  | `self.weather_query`       | 天气查询              | city（可选，默认自动定位）    | 无状态                   | wttr.in API，IP 自动定位               |
+| 6   | `self.medication_reminder` | 服药提醒增删查        | add / remove / list           | NVS `medication`         |                                        |
+| 7   | `self.fall_detection`      | 拍照+视觉分析是否跌倒 | 无                            | 无状态                   | 返回 `{fell, confidence, description}` |
+| 8   | `self.family_voice_board`  | 家属留言板（文字）    | add / list                    | NVS `voice_board`        |                                        |
+| 9   | `self.medication_log`      | 用药打卡记录          | checkin / status / list_today | NVS `medication`         | 与服药提醒配合，形成闭环               |
+| 10  | `self.schedule_reminder`   | 通用日程提醒          | add / remove / list           | NVS `reminders`          | 到点自动播报（需开 Kconfig）           |
+| 11  | `self.emergency_contact`   | 紧急联系人管理        | add / remove / list           | NVS `emergency_contacts` | SOS 触发时自动显示                     |
+| 12  | `self.find_item`           | 找东西（拍照+视觉）   | item_name                     | 无状态                   | 受 VisionGuard 互斥锁保护              |
+| 13  | `self.door_identification` | 门口来人识别          | 无                            | 无状态                   | 防诈骗，同上互斥锁                     |
+| 14  | `self.weather_query`       | 天气查询              | city（可选，默认自动定位）    | 无状态                   | wttr.in API，IP 自动定位               |
 
 ### 语音触发示例
 
@@ -141,12 +129,11 @@ ESP32-S3-N16R8 上大部分 GPIO 已被摄像头 DVP、显示屏 SPI、I2S 音�
 
 ### MCP 工具注册位置
 
-| 工具范围                     | 文件路径                                                           | 函数                                          | 行号范围                                               |
-| ---------------------------- | ------------------------------------------------------------------ | --------------------------------------------- | ------------------------------------------------------ |
-| #1-#5 官方内置               | `main/mcp_server.cc`                                               | `McpServer::RegisterBuiltinTools()`           | ~39-110                                                |
-| #6-#8 学习版（Kconfig 开关） | `main/mcp_server.cc`                                               | `McpServer::RegisterSilverEconomyDemoTools()` | ~131-320（`#ifdef CONFIG_ENABLE_SILVER_ECONOMY_DEMO`） |
-| #9-#17 板级正式版            | `main/boards/bread-compact-wifi-s3cam/compact_wifi_board_s3cam.cc` | `CompactWifiBoardS3Cam::InitializeTools()`    | ~270-830                                               |
-| #18-#20 云端工具             | `family_service.py`                                                | 模块顶层 `@mcp.tool()` 装饰器                 | 全文件                                                 |
+| 工具范围         | 文件路径                                                           | 函数                                       | 行号范围 |
+| ---------------- | ------------------------------------------------------------------ | ------------------------------------------ | -------- |
+| #1-#5 官方内置   | `main/mcp_server.cc`                                               | `McpServer::RegisterBuiltinTools()`        | ~39-116  |
+| #6-#14 板级工具  | `main/boards/bread-compact-wifi-s3cam/compact_wifi_board_s3cam.cc` | `CompactWifiBoardS3Cam::InitializeTools()` | ~270-830 |
+| #15-#17 云端工具 | `family_service.py`                                                | 模块顶层 `@mcp.tool()` 装饰器              | 全文件   |
 
 ### 后台任务注册位置
 
