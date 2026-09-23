@@ -68,28 +68,164 @@ static const gc9a01_lcd_init_cmd_t gc9107_lcd_init_cmds[] = {
 #define TAG "CompactWifiBoardS3Cam"
 
 // ------------------------------------------------------------------
-// 提醒音重复播放：Alert 自带音效只有一声短音，老人容易漏听。
-// 在首次 Alert 之后，用 esp_timer 再补播 extra_times 次，让提醒更醒目。
-// sound 必须指向 static 存储期的音效对象（如 &Lang::Sounds::OGG_EXCLAMATION），
-// 保证 timer 回调执行时指针有效。可在任意任务上下文调用。
+// 银发告警状态机：弹窗 / 大音量 / 补声 / 屏幕保持 一体化管理。
+// 为什么需要"屏幕保持"：状态机切回 Idle/Connecting 时会清空聊天消息
+// （application.cc 的 SetDeviceState 处理），告警文本可能一闪而过，
+// 老人还没看清就没了。因此每次补声的同时重写屏幕，补声结束后再持续
+// 重写几次；若期间开始了新对话，新消息会自然覆盖告警。
 // ------------------------------------------------------------------
-static void ScheduleRepeatedSound(const std::string_view* sound,
-                                  int extra_times, int interval_ms) {
-    for (int i = 1; i <= extra_times; ++i) {
-        esp_timer_handle_t timer = nullptr;
-        esp_timer_create_args_t args = {};
-        args.callback = [](void* arg) {
-            auto* s = static_cast<const std::string_view*>(arg);
-            Application::GetInstance().Schedule([s]() {
-                Application::GetInstance().PlaySound(*s);
-            });
-        };
-        args.dispatch_method = ESP_TIMER_TASK;
-        args.name = "alert_rep";
-        if (esp_timer_create(&args, &timer) == ESP_OK) {
-            esp_timer_start_once(timer, (uint64_t)i * interval_ms * 1000);
-        }
+struct ElderAlertState {
+    std::string title;
+    std::string message;
+    std::string emotion;
+    const std::string_view* sound;
+    int beeps_left;      // 还需补播的次数
+    int reasserts_left;  // 补声结束后继续重写屏幕的次数
+    int interval_ms;
+};
+
+static void ElderAlertFire(void* arg);
+
+// 下一跳定时：把 state 挂到新的一次性 esp_timer 上
+static void ElderAlertScheduleNext(ElderAlertState* state, int delay_ms) {
+    esp_timer_create_args_t args = {};
+    args.callback = ElderAlertFire;
+    args.arg = state;  // esp_timer 不自动传参，漏设即 nullptr 崩溃
+    args.dispatch_method = ESP_TIMER_TASK;
+    args.name = "elder_alert";
+    esp_timer_handle_t timer = nullptr;
+    if (esp_timer_create(&args, &timer) == ESP_OK) {
+        esp_timer_start_once(timer, (uint64_t)delay_ms * 1000);
+    } else {
+        delete state;  // 无法继续调度时释放，避免泄漏
     }
+}
+
+// esp_timer 回调（ESP_TIMER_TASK 上下文）：UI/音频操作必须 Schedule 回主任务
+static void ElderAlertFire(void* arg) {
+    auto* state = static_cast<ElderAlertState*>(arg);
+    bool need_more = false;
+
+    if (state->beeps_left > 0) {
+        state->beeps_left--;
+        need_more = true;
+        const std::string_view* sound = state->sound;
+        Application::GetInstance().Schedule([sound]() {
+            Application::GetInstance().PlaySound(*sound);
+        });
+    }
+
+    // 字符串按值拷入 lambda：最后一次触发会 delete state，避免悬垂
+    Application::GetInstance().Schedule([t = state->title, m = state->message,
+                                         e = state->emotion]() {
+        auto display = Board::GetInstance().GetDisplay();
+        display->SetStatus(t.c_str());
+        display->SetEmotion(e.c_str());
+        display->SetChatMessage("system", m.c_str());
+    });
+
+    if (state->reasserts_left > 0) {
+        state->reasserts_left--;
+        need_more = true;
+    }
+
+    if (need_more) {
+        int delay = state->beeps_left > 0 ? state->interval_ms : 3000;
+        ElderAlertScheduleNext(state, delay);
+    } else {
+        // 收尾释放状态。中间过程的 esp_timer 句柄未删除（每次告警泄漏
+        // 约百字节，告警频率低，可接受）。
+        delete state;
+    }
+}
+
+// ------------------------------------------------------------------
+// 告警结束后恢复原音量：一次性 esp_timer，留 1.5 秒余量等最后一声播完。
+// ------------------------------------------------------------------
+static void RestoreVolumeLater(int volume, int delay_ms) {
+    int* boxed = new int(volume);
+    esp_timer_handle_t timer = nullptr;
+    esp_timer_create_args_t args = {};
+    args.callback = [](void* arg) {
+        int vol = *static_cast<int*>(arg);
+        delete static_cast<int*>(arg);
+        Application::GetInstance().Schedule([v = vol]() {
+            auto* codec = Board::GetInstance().GetAudioCodec();
+            if (codec) codec->SetOutputVolume(v);
+        });
+    };
+    args.arg = boxed;  // esp_timer 不自动传参，漏设即 nullptr 崩溃
+    args.dispatch_method = ESP_TIMER_TASK;
+    args.name = "alert_vol";
+    if (esp_timer_create(&args, &timer) == ESP_OK) {
+        esp_timer_start_once(timer, (uint64_t)delay_ms * 1000);
+    } else {
+        delete boxed;
+    }
+}
+
+// ------------------------------------------------------------------
+// 银发告警统一入口（必须在主任务上下文调用，即 Schedule 内部）：
+// 1) 音量临时拉到 100——默认音量（70）在厨房/电视环境下老人容易漏听
+// 2) Alert 弹窗 + 首声，随后补播 extra_beeps 声
+// 3) 屏幕信息每次触发都重写，补声结束后再保持约 12 秒
+// 4) 全部播完后恢复原音量
+// emotion 须用固件支持的表情名（"warning" 无对应图标，映射为 angry）
+// ------------------------------------------------------------------
+static void ShowElderAlert(const char* title, const char* message,
+                           const char* emotion, int extra_beeps = 2,
+                           int interval_ms = 2000) {
+    auto& app = Application::GetInstance();
+    auto* codec = Board::GetInstance().GetAudioCodec();
+    int previous_volume = 0;
+    if (codec) {
+        previous_volume = codec->output_volume();
+        codec->SetOutputVolume(100);
+    }
+    std::string emo = (emotion != nullptr && std::string_view(emotion) == "warning")
+                          ? "angry" : "neutral";
+    app.Alert(title, message, emo.c_str(), Lang::Sounds::OGG_EXCLAMATION);
+
+    auto* state = new ElderAlertState{title, message, emo,
+                                      &Lang::Sounds::OGG_EXCLAMATION,
+                                      extra_beeps, 4, interval_ms};
+    ElderAlertScheduleNext(state, interval_ms);  // 首次补声在 +interval
+
+    if (previous_volume > 0) {
+        RestoreVolumeLater(previous_volume, (extra_beeps + 1) * interval_ms + 1500);
+    }
+}
+
+// ------------------------------------------------------------------
+// 留言板过期清理：删除 epoch 距今超过保留期（VOICE_BOARD_MSG_TTL_DAYS
+// 天，默认 3）的留言；无 epoch 字段的旧格式留言一并清理。
+// 系统时间未同步时跳过清理。返回删除条数。
+// ------------------------------------------------------------------
+static int PurgeExpiredVoiceMessages(cJSON* root) {
+    time_t now = time(nullptr);
+    if (now <= 1700000000) {
+        return 0;  // 时间未同步，无法判断过期
+    }
+    const double ttl_sec = (double)CONFIG_VOICE_BOARD_MSG_TTL_DAYS * 86400.0;
+    int removed = 0;
+    int kept = 0;
+    cJSON* elem = root->child;
+    while (elem != nullptr) {
+        cJSON* next = elem->next;
+        cJSON* epoch = cJSON_GetObjectItem(elem, "epoch");
+        double age = -1.0;
+        if (cJSON_IsNumber(epoch)) {
+            age = (double)now - epoch->valuedouble;
+        }
+        if (age < 0.0 || age >= ttl_sec) {
+            cJSON_DeleteItemFromArray(root, kept);
+            removed++;
+        } else {
+            kept++;
+        }
+        elem = next;
+    }
+    return removed;
 }
 
 class CompactWifiBoardS3Cam : public WifiBoard {
@@ -248,10 +384,7 @@ private:
             // UI/音频/MCP 消息必须回主任务
             Application::GetInstance().Schedule([message]() {
                 auto& app = Application::GetInstance();
-                app.Alert("紧急求助", message.c_str(), "warning",
-                          Lang::Sounds::OGG_EXCLAMATION);
-                // SOS 必须醒目：共播 3 声，间隔 2 秒
-                ScheduleRepeatedSound(&Lang::Sounds::OGG_EXCLAMATION, 2, 2000);
+                ShowElderAlert("紧急求助", message.c_str(), "warning");
                 app.SendMcpMessage(
                     "{\"type\":\"sos_alert\",\"source\":\"device\"}");
             });
@@ -369,6 +502,8 @@ private:
         mcp.AddTool(
             "self.family_voice_board",
             "家属留言板。家属可远程为老人添加文字留言，老人按键时设备会朗读。\n"
+            "留言默认保留 3 天（menuconfig VOICE_BOARD_MSG_TTL_DAYS 可调 1-30 天），\n"
+            "到期自动删除。\n"
             "Args:\n"
             "  action: 'add' | 'list' | 'play_latest'\n"
             "  sender: 留言人姓名（add 时必填）\n"
@@ -395,6 +530,13 @@ private:
                     root = cJSON_CreateArray();
                 }
 
+                // 过期留言自动清理：有删除则立即写回 NVS
+                if (PurgeExpiredVoiceMessages(root) > 0) {
+                    char* out = cJSON_PrintUnformatted(root);
+                    settings.SetString("messages", out);
+                    free(out);
+                }
+
                 if (action == "add") {
                     if (sender.empty() || message.empty()) {
                         cJSON_Delete(root);
@@ -412,6 +554,7 @@ private:
                     cJSON_AddStringToObject(item, "sender", sender.c_str());
                     cJSON_AddStringToObject(item, "message", message.c_str());
                     cJSON_AddStringToObject(item, "time", time_buf);
+                    cJSON_AddNumberToObject(item, "epoch", (double)now);
                     cJSON_AddItemToArray(root, item);
                     char* out = cJSON_PrintUnformatted(root);
                     settings.SetString("messages", out);
@@ -449,22 +592,30 @@ private:
         // 工具 4：用药打卡记录
         mcp.AddTool(
             "self.medication_log",
-            "记录和查询老人今天是否已服药（打卡功能）。\n"
-            "仅用于 checkin（老人说'我吃过药了'）和 status（查'今天药吃了没'），\n"
-            "不回答用药咨询问题（如漏服处理、药物禁忌、何时补服等），\n"
+            "记录和查询老人的服药情况（打卡+医嘱依从性）。\n"
+            "仅用于打卡和查记录，不回答用药咨询问题（如漏服处理、药物禁忌、何时补服等），\n"
             "此类问题请直接回答，不要调用本工具。\n"
             "Args:\n"
-            "  action: 'checkin' | 'status' | 'list_today'\n"
-            "  medicine: 药名（checkin 时必填）\n"
+            "  action: 'checkin' | 'status' | 'list_today' | 'report' | 'history'\n"
+            "  medicine: 药名（checkin/status 时必填）\n"
+            "  days: history 时可选，查询最近几天（默认7，最多7）\n"
             "Return:\n"
-            "  list_today 返回今日已打卡的药名列表；status 返回某药今日是否已打卡。",
+            "  list_today 返回今日打卡事件 [{medicine, time}, ...]（time 为打卡时刻 HH:MM）；\n"
+            "  status 返回 {taken, time}，未打卡时 time 为空；\n"
+            "  report 返回今日医嘱执行情况 {doses:[{medicine, planned, status, actual, delay}],\n"
+            "    total, taken, late, missed, pending, unplanned}，"
+            "status: taken按时/late迟服/missed漏服/pending待服，delay 为比计划晚的分钟数；\n"
+            "  history 返回最近 days 天的剂量记录 [{date, doses}, ...]。\n"
+            "  report/history 需开启 ENABLE_MEDICATION_REMINDER_TASK。",
             PropertyList({
                 Property("action", kPropertyTypeString),
                 Property("medicine", kPropertyTypeString, std::string("")),
+                Property("days", kPropertyTypeInteger, 7),
             }),
             [](const PropertyList& properties) -> ToolResult {
                 auto action = properties["action"].value<std::string>();
                 auto medicine = properties["medicine"].value<std::string>();
+                auto days = properties["days"].value<int>();
 
                 Settings settings("medication", true);
                 std::string stored = settings.GetString("logs", "{}");
@@ -476,11 +627,29 @@ private:
 
                 time_t now = time(nullptr);
                 char today[16] = {0};
-                if (now > 1700000000) {
+                char clock[8] = {0};
+                bool time_valid = now > 1700000000;
+                if (time_valid) {
                     strftime(today, sizeof(today), "%Y-%m-%d", localtime(&now));
+                    strftime(clock, sizeof(clock), "%H:%M", localtime(&now));
                 } else {
                     snprintf(today, sizeof(today), "unknown");
                 }
+
+                // 兼容旧数据：从数组元素中取药名。
+                // 旧格式为纯字符串 "降压药"，新格式为 {"medicine":"降压药","time":"08:30"}。
+                auto elem_medicine = [](cJSON* elem) -> const char* {
+                    if (cJSON_IsString(elem)) {
+                        return elem->valuestring;
+                    }
+                    if (cJSON_IsObject(elem)) {
+                        cJSON* m = cJSON_GetObjectItem(elem, "medicine");
+                        if (cJSON_IsString(m)) {
+                            return m->valuestring;
+                        }
+                    }
+                    return nullptr;
+                };
 
                 if (action == "checkin") {
                     if (medicine.empty()) {
@@ -492,21 +661,30 @@ private:
                         day_arr = cJSON_CreateArray();
                         cJSON_AddItemToObject(root, today, day_arr);
                     }
-                    // 避免重复打卡
+                    // 避免重复打卡；已打过卡则保留原记录（含原打卡时间）
                     cJSON* elem = nullptr;
                     cJSON_ArrayForEach(elem, day_arr) {
-                        if (cJSON_IsString(elem) &&
-                            strcmp(elem->valuestring, medicine.c_str()) == 0) {
+                        const char* name = elem_medicine(elem);
+                        if (name != nullptr && strcmp(name, medicine.c_str()) == 0) {
                             char* out = cJSON_PrintUnformatted(root);
                             settings.SetString("logs", out);
                             free(out);
                             return root;
                         }
                     }
-                    cJSON_AddItemToArray(day_arr, cJSON_CreateString(medicine.c_str()));
+                    cJSON* record = cJSON_CreateObject();
+                    cJSON_AddStringToObject(record, "medicine", medicine.c_str());
+                    cJSON_AddStringToObject(record, "time", time_valid ? clock : "unknown");
+                    cJSON_AddItemToArray(day_arr, record);
                     char* out = cJSON_PrintUnformatted(root);
                     settings.SetString("logs", out);
                     free(out);
+#ifdef CONFIG_ENABLE_MEDICATION_REMINDER_TASK
+                    // 联动当日医嘱剂量状态：pending -> taken，missed -> late
+                    if (time_valid) {
+                        RecordMedicationCheckin(medicine, now);
+                    }
+#endif
                     return root;
                 }
 
@@ -517,18 +695,28 @@ private:
                     }
                     cJSON* day_arr = cJSON_GetObjectItem(root, today);
                     bool taken = false;
+                    std::string taken_time;
                     if (day_arr != nullptr && cJSON_IsArray(day_arr)) {
                         cJSON* elem = nullptr;
                         cJSON_ArrayForEach(elem, day_arr) {
-                            if (cJSON_IsString(elem) &&
-                                strcmp(elem->valuestring, medicine.c_str()) == 0) {
+                            const char* name = elem_medicine(elem);
+                            if (name != nullptr && strcmp(name, medicine.c_str()) == 0) {
                                 taken = true;
+                                if (cJSON_IsObject(elem)) {
+                                    cJSON* t = cJSON_GetObjectItem(elem, "time");
+                                    if (cJSON_IsString(t)) {
+                                        taken_time = t->valuestring;
+                                    }
+                                }
                                 break;
                             }
                         }
                     }
                     cJSON_Delete(root);
-                    std::string result = taken ? "taken" : "not_taken";
+                    cJSON* result = cJSON_CreateObject();
+                    cJSON_AddBoolToObject(result, "taken", taken);
+                    cJSON_AddStringToObject(result, "time",
+                                           taken ? taken_time.c_str() : "");
                     return result;
                 }
 
@@ -542,6 +730,25 @@ private:
                     cJSON_Delete(root);
                     return result;
                 }
+
+#ifdef CONFIG_ENABLE_MEDICATION_REMINDER_TASK
+                if (action == "report") {
+                    cJSON_Delete(root);
+                    return BuildMedicationReport(now);
+                }
+
+                if (action == "history") {
+                    cJSON_Delete(root);
+                    return BuildMedicationHistory(days, now);
+                }
+#else
+                if (action == "report" || action == "history") {
+                    cJSON_Delete(root);
+                    (void)days;
+                    return std::unexpected(
+                        "Medication reminder task is not enabled in firmware");
+                }
+#endif
 
                 cJSON_Delete(root);
                 return std::unexpected("Unknown action: " + action);
@@ -989,12 +1196,10 @@ private:
         Application::GetInstance().Schedule([description]() {
             auto& app = Application::GetInstance();
             // 把模型的描述一起带上，屏幕和家属端能看到具体发生了什么
-            app.Alert("跌倒警报",
-                      description.empty() ? "检测到老人可能跌倒，请立即确认"
-                                          : description.c_str(),
-                      "warning", Lang::Sounds::OGG_EXCLAMATION);
-            // 跌倒警报重复播放，共 3 声
-            ScheduleRepeatedSound(&Lang::Sounds::OGG_EXCLAMATION, 2, 2000);
+            ShowElderAlert("跌倒警报",
+                           description.empty() ? "检测到老人可能跌倒，请立即确认"
+                                               : description.c_str(),
+                           "warning");
             app.SendMcpMessage(
                 "{\"type\":\"fall_alert\",\"source\":\"device\"}");
         });
@@ -1068,11 +1273,7 @@ private:
                 ESP_LOGI(TAG, "schedule_reminder: firing '%s' at %s",
                          content.c_str(), cur.c_str());
                 Application::GetInstance().Schedule([content]() {
-                    Application::GetInstance().Alert(
-                        "日程提醒", content.c_str(), "info",
-                        Lang::Sounds::OGG_EXCLAMATION);
-                    // 短音容易漏听：共播 3 声，间隔 2 秒
-                    ScheduleRepeatedSound(&Lang::Sounds::OGG_EXCLAMATION, 2, 2000);
+                    ShowElderAlert("日程提醒", content.c_str(), "info");
                 });
             }
         }
@@ -1100,6 +1301,434 @@ private:
         ESP_LOGI(TAG, "schedule_reminder: timer started, checking every 60s");
     }
 #endif  // CONFIG_ENABLE_SCHEDULE_REMINDER
+
+#ifdef CONFIG_ENABLE_MEDICATION_REMINDER_TASK
+    // ====================================================================
+    // 服药提醒闭环后台任务
+    // --------------------------------------------------------------------
+    // 完整流程：医嘱计划(medication_reminder) -> 到点主动提醒 -> 重复催促
+    //          -> 老人打卡(medication_log checkin) / 超时判漏服 -> 记录查询
+    //
+    // NVS 布局（命名空间 medication）：
+    //   reminders             : [{time:"08:00", medicine:"降压药"}]  医嘱计划
+    //   logs                  : {"2026-09-23":[{medicine,time}]}    打卡事件流
+    //   dYYYYMMDD（≤15字符）  : 当日剂量状态数组
+    //     [{medicine, planned, status, reminds, actual, delay}]
+    //     status: pending（未到点/未打卡）/ taken（按时打卡）
+    //             / late（漏服判定后补卡）/ missed（漏服）
+    //
+    // 状态机（每条计划独立推进，绝对分钟数判断，避免分钟窗口漏触发）：
+    //   到点 -> 提醒第 1 次；每 INTERVAL 分钟未打卡再提醒，最多 MAX_TIMES 次；
+    //   超过 MISSED_TIMEOUT 分钟仍未打卡 -> missed，弹窗告警并通知云端。
+    // ====================================================================
+
+    esp_timer_handle_t medication_timer_ = nullptr;
+    std::string medication_last_minute_;
+
+    // 日期 -> 当日剂量状态 NVS 键，如 "d20260923"（NVS 键最长 15 字符）
+    static std::string MedicationDoseKey(time_t t) {
+        struct tm tm_info = {};
+        localtime_r(&t, &tm_info);
+        char buf[12] = {0};
+        strftime(buf, sizeof(buf), "d%Y%m%d", &tm_info);
+        return buf;
+    }
+
+    static std::string MedicationDate(time_t t) {
+        struct tm tm_info = {};
+        localtime_r(&t, &tm_info);
+        char buf[16] = {0};
+        strftime(buf, sizeof(buf), "%Y-%m-%d", &tm_info);
+        return buf;
+    }
+
+    static int ParseHHMM(const std::string& hm) {
+        if (hm.size() < 5 || hm[2] != ':') {
+            return -1;
+        }
+        int h = (hm[0] - '0') * 10 + (hm[1] - '0');
+        int m = (hm[3] - '0') * 10 + (hm[4] - '0');
+        if (h < 0 || h > 23 || m < 0 || m > 59) {
+            return -1;
+        }
+        return h * 60 + m;
+    }
+
+    // 老人打卡时联动当日剂量状态。静态：MCP 回调是无捕获 lambda。
+    static void RecordMedicationCheckin(const std::string& medicine, time_t now) {
+        Settings settings("medication", true);
+        std::string key = MedicationDoseKey(now);
+        cJSON* doses = cJSON_Parse(settings.GetString(key, "[]").c_str());
+        if (doses == nullptr || !cJSON_IsArray(doses)) {
+            if (doses) cJSON_Delete(doses);
+            return;  // 当天没有计划剂量（属于计划外打卡，只写 logs）
+        }
+
+        struct tm tm_info = {};
+        localtime_r(&now, &tm_info);
+        int now_min = tm_info.tm_hour * 60 + tm_info.tm_min;
+        char clock[8] = {0};
+        strftime(clock, sizeof(clock), "%H:%M", &tm_info);
+
+        auto match_dose = [&](const char* want_status) -> cJSON* {
+            cJSON* elem = nullptr;
+            cJSON_ArrayForEach(elem, doses) {
+                cJSON* med = cJSON_GetObjectItem(elem, "medicine");
+                cJSON* st = cJSON_GetObjectItem(elem, "status");
+                if (med && cJSON_IsString(med) && st && cJSON_IsString(st) &&
+                    medicine == med->valuestring &&
+                    strcmp(st->valuestring, want_status) == 0) {
+                    return elem;
+                }
+            }
+            return nullptr;
+        };
+
+        // 优先匹配仍在等待打卡的剂量；其次匹配已判漏服的（补卡 -> late 迟服）
+        cJSON* target = match_dose("pending");
+        const char* new_status = "taken";
+        if (target == nullptr) {
+            target = match_dose("missed");
+            new_status = "late";
+        }
+        if (target == nullptr) {
+            cJSON_Delete(doses);
+            return;
+        }
+
+        cJSON* planned = cJSON_GetObjectItem(target, "planned");
+        int planned_min = (planned && cJSON_IsString(planned))
+                              ? ParseHHMM(planned->valuestring) : -1;
+        // 延迟分钟数（提前吃药记 0）
+        int delay = 0;
+        if (planned_min >= 0 && now_min > planned_min) {
+            delay = now_min - planned_min;
+        }
+
+        cJSON_ReplaceItemInObject(target, "status", cJSON_CreateString(new_status));
+        cJSON_ReplaceItemInObject(target, "actual", cJSON_CreateString(clock));
+        cJSON_ReplaceItemInObject(target, "delay", cJSON_CreateNumber(delay));
+
+        char* out = cJSON_PrintUnformatted(doses);
+        settings.SetString(key, out);
+        free(out);
+        cJSON_Delete(doses);
+        ESP_LOGI(TAG, "medication: checkin %s -> %s, delay=%d min", medicine.c_str(),
+                 new_status, delay);
+    }
+
+    // 今日服药报告：医嘱剂量状态 + 计划外打卡 + 汇总计数
+    static cJSON* BuildMedicationReport(time_t now) {
+        Settings settings("medication", true);
+        std::string key = MedicationDoseKey(now);
+        cJSON* doses = cJSON_Parse(settings.GetString(key, "[]").c_str());
+        if (doses == nullptr || !cJSON_IsArray(doses)) {
+            if (doses) cJSON_Delete(doses);
+            doses = cJSON_CreateArray();
+        }
+
+        cJSON* report = cJSON_CreateObject();
+        cJSON_AddStringToObject(report, "date", MedicationDate(now).c_str());
+
+        int n_total = 0, n_taken = 0, n_late = 0, n_missed = 0, n_pending = 0;
+        cJSON* elem = nullptr;
+        cJSON_ArrayForEach(elem, doses) {
+            n_total++;
+            cJSON* st = cJSON_GetObjectItem(elem, "status");
+            if (st && cJSON_IsString(st)) {
+                if (strcmp(st->valuestring, "taken") == 0) {
+                    n_taken++;
+                } else if (strcmp(st->valuestring, "late") == 0) {
+                    n_late++;
+                } else if (strcmp(st->valuestring, "missed") == 0) {
+                    n_missed++;
+                } else {
+                    n_pending++;
+                }
+            }
+        }
+        cJSON_AddItemToObject(report, "doses", doses);  // 移交所有权
+        cJSON_AddNumberToObject(report, "total", n_total);
+        cJSON_AddNumberToObject(report, "taken", n_taken);
+        cJSON_AddNumberToObject(report, "late", n_late);
+        cJSON_AddNumberToObject(report, "missed", n_missed);
+        cJSON_AddNumberToObject(report, "pending", n_pending);
+
+        // 计划外打卡：logs 里有、但不在当日医嘱剂量中的药
+        cJSON* unplanned = cJSON_CreateArray();
+        cJSON* logs = cJSON_Parse(settings.GetString("logs", "{}").c_str());
+        if (logs && cJSON_IsObject(logs)) {
+            cJSON* day_logs = cJSON_GetObjectItem(logs, MedicationDate(now).c_str());
+            if (day_logs && cJSON_IsArray(day_logs)) {
+                cJSON* log_elem = nullptr;
+                cJSON_ArrayForEach(log_elem, day_logs) {
+                    const char* name = nullptr;
+                    const char* at = "";
+                    if (cJSON_IsString(log_elem)) {
+                        name = log_elem->valuestring;
+                    } else if (cJSON_IsObject(log_elem)) {
+                        cJSON* m = cJSON_GetObjectItem(log_elem, "medicine");
+                        cJSON* t = cJSON_GetObjectItem(log_elem, "time");
+                        name = cJSON_IsString(m) ? m->valuestring : nullptr;
+                        at = cJSON_IsString(t) ? t->valuestring : "";
+                    }
+                    if (name == nullptr) {
+                        continue;
+                    }
+                    bool in_plan = false;
+                    cJSON_ArrayForEach(elem, doses) {
+                        cJSON* dmed = cJSON_GetObjectItem(elem, "medicine");
+                        if (dmed && cJSON_IsString(dmed) &&
+                            strcmp(dmed->valuestring, name) == 0) {
+                            in_plan = true;
+                            break;
+                        }
+                    }
+                    if (!in_plan) {
+                        cJSON* item = cJSON_CreateObject();
+                        cJSON_AddStringToObject(item, "medicine", name);
+                        cJSON_AddStringToObject(item, "time", at);
+                        cJSON_AddItemToArray(unplanned, item);
+                    }
+                }
+            }
+        }
+        if (logs) cJSON_Delete(logs);
+        cJSON_AddItemToObject(report, "unplanned", unplanned);
+        return report;
+    }
+
+    // 历史记录：最近 days 天（含今天）的剂量记录，按日期升序
+    static cJSON* BuildMedicationHistory(int days, time_t now) {
+        if (days < 1) {
+            days = 1;
+        }
+        if (days > CONFIG_MEDICATION_LOG_KEEP_DAYS) {
+            days = CONFIG_MEDICATION_LOG_KEEP_DAYS;
+        }
+        Settings settings("medication", true);
+        cJSON* history = cJSON_CreateArray();
+        for (int age = days - 1; age >= 0; age--) {
+            time_t day_time = now - age * 86400;
+            std::string raw = settings.GetString(MedicationDoseKey(day_time), "");
+            if (raw.empty()) {
+                continue;
+            }
+            cJSON* doses = cJSON_Parse(raw.c_str());
+            if (doses == nullptr || !cJSON_IsArray(doses)) {
+                if (doses) cJSON_Delete(doses);
+                continue;
+            }
+            cJSON* day_obj = cJSON_CreateObject();
+            cJSON_AddStringToObject(day_obj, "date", MedicationDate(day_time).c_str());
+            cJSON_AddItemToObject(day_obj, "doses", doses);
+            cJSON_AddItemToArray(history, day_obj);
+        }
+        return history;
+    }
+
+    static void MedicationTimerCb(void* arg) {
+        auto* self = static_cast<CompactWifiBoardS3Cam*>(arg);
+        self->CheckMedicationReminders();
+    }
+
+    void FireMedicationDue(const std::string& medicine, const std::string& planned,
+                           int remind_times) {
+        std::string message = "该吃" + medicine + "了（计划 " + planned + "）。"
+                              "吃完请对我说：我吃过" + medicine + "了。";
+        if (remind_times > 1) {
+            message = "提醒第 " + std::to_string(remind_times) + " 次：" + message;
+        }
+        Application::GetInstance().Schedule([message, medicine, planned]() {
+            ShowElderAlert("服药提醒", message.c_str(), "info");
+            // 通知云端，服务器配置自动化后可触发语音询问
+            cJSON* msg = cJSON_CreateObject();
+            cJSON_AddStringToObject(msg, "type", "medication_due");
+            cJSON_AddStringToObject(msg, "source", "device");
+            cJSON_AddStringToObject(msg, "medicine", medicine.c_str());
+            cJSON_AddStringToObject(msg, "planned", planned.c_str());
+            char* out = cJSON_PrintUnformatted(msg);
+            Application::GetInstance().SendMcpMessage(out);
+            free(out);
+            cJSON_Delete(msg);
+        });
+    }
+
+    void FireMedicationMissed(const std::string& medicine, const std::string& planned) {
+        std::string message = medicine + "（计划 " + planned +
+                              "）超过" + std::to_string(CONFIG_MEDICATION_MISSED_TIMEOUT_MIN) +
+                              "分钟未打卡，已记为漏服。";
+        Application::GetInstance().Schedule([message, medicine, planned]() {
+            ShowElderAlert("漏服提醒", message.c_str(), "warning");
+            cJSON* msg = cJSON_CreateObject();
+            cJSON_AddStringToObject(msg, "type", "medication_missed");
+            cJSON_AddStringToObject(msg, "source", "device");
+            cJSON_AddStringToObject(msg, "medicine", medicine.c_str());
+            cJSON_AddStringToObject(msg, "planned", planned.c_str());
+            char* out = cJSON_PrintUnformatted(msg);
+            Application::GetInstance().SendMcpMessage(out);
+            free(out);
+            cJSON_Delete(msg);
+        });
+    }
+
+    void CheckMedicationReminders() {
+        time_t now = time(nullptr);
+        if (now < 1700000000) {
+            return;  // 系统时间未同步
+        }
+
+        struct tm tm_info = {};
+        localtime_r(&now, &tm_info);
+        char cur_hm[6] = {0};
+        strftime(cur_hm, sizeof(cur_hm), "%H:%M", &tm_info);
+        std::string cur = cur_hm;
+        if (cur == medication_last_minute_) {
+            return;  // 同一分钟只处理一次
+        }
+        medication_last_minute_ = cur;
+        int now_min = tm_info.tm_hour * 60 + tm_info.tm_min;
+
+        Settings settings("medication", true);
+
+        // 1. 根据医嘱计划生成当日剂量（计划新增后，第二天/当天首次检查时生效）
+        std::string key = MedicationDoseKey(now);
+        cJSON* doses = cJSON_Parse(settings.GetString(key, "[]").c_str());
+        if (doses == nullptr) {
+            doses = cJSON_CreateArray();
+        }
+        if (!cJSON_IsArray(doses)) {
+            cJSON_Delete(doses);
+            doses = cJSON_CreateArray();
+        }
+
+        bool changed = false;
+        cJSON* plans = cJSON_Parse(settings.GetString("reminders", "[]").c_str());
+        if (plans != nullptr && cJSON_IsArray(plans)) {
+            cJSON* plan = nullptr;
+            cJSON_ArrayForEach(plan, plans) {
+                cJSON* ptime = cJSON_GetObjectItem(plan, "time");
+                cJSON* pmed = cJSON_GetObjectItem(plan, "medicine");
+                if (!cJSON_IsString(ptime) || !cJSON_IsString(pmed)) {
+                    continue;
+                }
+                bool exists = false;
+                cJSON* elem = nullptr;
+                cJSON_ArrayForEach(elem, doses) {
+                    cJSON* dmed = cJSON_GetObjectItem(elem, "medicine");
+                    cJSON* dplanned = cJSON_GetObjectItem(elem, "planned");
+                    if (dmed && cJSON_IsString(dmed) && dplanned && cJSON_IsString(dplanned) &&
+                        strcmp(dmed->valuestring, pmed->valuestring) == 0 &&
+                        strcmp(dplanned->valuestring, ptime->valuestring) == 0) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) {
+                    cJSON* dose = cJSON_CreateObject();
+                    cJSON_AddStringToObject(dose, "medicine", pmed->valuestring);
+                    cJSON_AddStringToObject(dose, "planned", ptime->valuestring);
+                    cJSON_AddStringToObject(dose, "status", "pending");
+                    cJSON_AddNumberToObject(dose, "reminds", 0);
+                    cJSON_AddStringToObject(dose, "actual", "");
+                    cJSON_AddNumberToObject(dose, "delay", -1);
+                    cJSON_AddItemToArray(doses, dose);
+                    changed = true;
+                }
+            }
+        }
+        if (plans) cJSON_Delete(plans);
+        if (changed) {
+            char* out = cJSON_PrintUnformatted(doses);
+            settings.SetString(key, out);
+            free(out);
+        }
+
+        // 2. 清理过期记录（保留 CONFIG_MEDICATION_LOG_KEEP_DAYS 天）
+        for (int age = CONFIG_MEDICATION_LOG_KEEP_DAYS;
+             age <= CONFIG_MEDICATION_LOG_KEEP_DAYS + 2; age++) {
+            settings.EraseKey(MedicationDoseKey(now - age * 86400));
+        }
+
+        // 3. 逐条推进状态机
+        cJSON* elem = nullptr;
+        cJSON_ArrayForEach(elem, doses) {
+            cJSON* st = cJSON_GetObjectItem(elem, "status");
+            cJSON* planned = cJSON_GetObjectItem(elem, "planned");
+            cJSON* med = cJSON_GetObjectItem(elem, "medicine");
+            if (!cJSON_IsString(st) || !cJSON_IsString(planned) || !cJSON_IsString(med) ||
+                strcmp(st->valuestring, "pending") != 0) {
+                continue;
+            }
+            int planned_min = ParseHHMM(planned->valuestring);
+            if (planned_min < 0) {
+                continue;
+            }
+            int delta = now_min - planned_min;
+            if (delta < 0) {
+                continue;  // 还没到点
+            }
+
+            std::string medicine = med->valuestring;
+            std::string planned_hm = planned->valuestring;
+
+            if (delta >= CONFIG_MEDICATION_MISSED_TIMEOUT_MIN) {
+                // 超时未打卡 -> 漏服
+                cJSON_ReplaceItemInObject(elem, "status", cJSON_CreateString("missed"));
+                cJSON_ReplaceItemInObject(elem, "delay",
+                                          cJSON_CreateNumber(delta));
+                char* out = cJSON_PrintUnformatted(doses);
+                settings.SetString(key, out);
+                free(out);
+                ESP_LOGW(TAG, "medication: MISSED %s planned=%s", medicine.c_str(),
+                         planned_hm.c_str());
+                FireMedicationMissed(medicine, planned_hm);
+                continue;
+            }
+
+            // 应提醒次数：首次 1 次，之后每 INTERVAL 分钟 +1，封顶 MAX_TIMES
+            int expected = 1 + delta / CONFIG_MEDICATION_REMIND_REPEAT_MINUTES;
+            if (expected > CONFIG_MEDICATION_REMIND_MAX_TIMES) {
+                expected = CONFIG_MEDICATION_REMIND_MAX_TIMES;
+            }
+            cJSON* reminds_item = cJSON_GetObjectItem(elem, "reminds");
+            int reminds = (reminds_item && cJSON_IsNumber(reminds_item))
+                              ? reminds_item->valueint : 0;
+            if (reminds < expected) {
+                cJSON_ReplaceItemInObject(elem, "reminds",
+                                          cJSON_CreateNumber(expected));
+                char* out = cJSON_PrintUnformatted(doses);
+                settings.SetString(key, out);
+                free(out);
+                ESP_LOGI(TAG, "medication: remind #%d for %s planned=%s", expected,
+                         medicine.c_str(), planned_hm.c_str());
+                FireMedicationDue(medicine, planned_hm, expected);
+            }
+        }
+        cJSON_Delete(doses);
+    }
+
+    void StartMedicationReminder() {
+        esp_timer_create_args_t args = {};
+        args.callback = MedicationTimerCb;
+        args.arg = this;
+        args.dispatch_method = ESP_TIMER_TASK;
+        args.name = "med_rem";
+        esp_err_t err = esp_timer_create(&args, &medication_timer_);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "medication_reminder: create timer failed: %s",
+                     esp_err_to_name(err));
+            return;
+        }
+        err = esp_timer_start_periodic(medication_timer_, 60 * 1000 * 1000);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "medication_reminder: start timer failed: %s",
+                     esp_err_to_name(err));
+            return;
+        }
+        ESP_LOGI(TAG, "medication_reminder: timer started, checking every 60s");
+    }
+#endif  // CONFIG_ENABLE_MEDICATION_REMINDER_TASK
 
 #ifdef CONFIG_ENABLE_SEDENTARY_REMINDER
     // ====================================================================
@@ -1181,11 +1810,7 @@ private:
         if (sedentary) {
             ESP_LOGW(TAG, "sedentary_reminder: person inactive, reminding");
             Application::GetInstance().Schedule([]() {
-                Application::GetInstance().Alert(
-                    "温馨提醒", "您已经坐了很久了，起来活动活动吧！",
-                    "info", Lang::Sounds::OGG_EXCLAMATION);
-                // 久坐提醒共播 3 声，间隔 2 秒
-                ScheduleRepeatedSound(&Lang::Sounds::OGG_EXCLAMATION, 2, 2000);
+                ShowElderAlert("温馨提醒", "您已经坐了很久了，起来活动活动吧！", "info");
             });
         }
     }
@@ -1306,12 +1931,9 @@ private:
                 ESP_LOGW(TAG, "bed_exit: bed empty too long, alerting!");
                 bed_empty_count_ = 0;
                 Application::GetInstance().Schedule([]() {
-                    Application::GetInstance().Alert(
-                        "离床告警",
-                        "老人已离床较长时间未返回，请确认是否安全。",
-                        "warning", Lang::Sounds::OGG_EXCLAMATION);
-                    // 离床告警共播 3 声，间隔 2 秒
-                    ScheduleRepeatedSound(&Lang::Sounds::OGG_EXCLAMATION, 2, 2000);
+                    ShowElderAlert("离床告警",
+                                   "老人已离床较长时间未返回，请确认是否安全。",
+                                   "warning");
                     Application::GetInstance().SendMcpMessage(
                         "{\"type\":\"bed_exit_alert\",\"source\":\"device\"}");
                 });
@@ -1360,6 +1982,9 @@ public:
 #endif
 #ifdef CONFIG_ENABLE_SCHEDULE_REMINDER
         StartScheduleReminder();
+#endif
+#ifdef CONFIG_ENABLE_MEDICATION_REMINDER_TASK
+        StartMedicationReminder();
 #endif
 #ifdef CONFIG_ENABLE_SEDENTARY_REMINDER
         StartSedentaryReminder();

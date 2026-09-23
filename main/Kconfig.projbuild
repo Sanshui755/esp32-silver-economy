@@ -1171,6 +1171,15 @@ menu "Silver Economy Demo"
             配合 self.schedule_reminder 工具使用（工具负责增删查，
             本开关负责到点播报）。
 
+    config VOICE_BOARD_MSG_TTL_DAYS
+        int "Voice Board Message Retention Days (Board)"
+        range 1 30
+        default 3
+        depends on BOARD_TYPE_BREAD_COMPACT_WIFI_CAM
+        help
+            家属留言板留言的保留天数，超期留言在下次读写时自动删除。
+            取值 1-30 天，默认 3 天。
+
     config ENABLE_SEDENTARY_REMINDER
         bool "Enable Sedentary / Inactivity Reminder (Board)"
         default n
@@ -1213,6 +1222,48 @@ menu "Silver Economy Demo"
         depends on ENABLE_BED_EXIT_DETECTION
         help
             床上连续无人超过该秒数后触发告警。默认 600（10 分钟）。
+
+    config ENABLE_MEDICATION_REMINDER_TASK
+        bool "Enable Proactive Medication Reminder Task (Board)"
+        default n
+        depends on BOARD_TYPE_BREAD_COMPACT_WIFI_CAM
+        help
+            启用服药提醒闭环后台任务：到医嘱时间自动弹窗+提示音提醒老人吃药，
+            未打卡时按设定间隔重复提醒，超过漏服时限仍未打卡则记为漏服。
+            配合 self.medication_reminder（计划）和 self.medication_log（打卡/查询）
+            两个工具使用，不依赖摄像头和云端视觉额度。
+
+    config MEDICATION_REMIND_REPEAT_MINUTES
+        int "Medication Re-Remind Interval (minutes)"
+        default 5
+        range 1 60
+        depends on ENABLE_MEDICATION_REMINDER_TASK
+        help
+            老人未打卡时，每隔多少分钟重复提醒一次。默认 5 分钟。
+
+    config MEDICATION_REMIND_MAX_TIMES
+        int "Medication Remind Max Times"
+        default 3
+        range 1 10
+        depends on ENABLE_MEDICATION_REMINDER_TASK
+        help
+            每条服药计划每次到点最多提醒几次（含首次）。默认 3 次。
+
+    config MEDICATION_MISSED_TIMEOUT_MIN
+        int "Medication Missed-Dose Timeout (minutes)"
+        default 30
+        range 5 240
+        depends on ENABLE_MEDICATION_REMINDER_TASK
+        help
+            超过计划时间多少分钟仍未打卡，判定为漏服并记入服药记录。默认 30 分钟。
+
+    config MEDICATION_LOG_KEEP_DAYS
+        int "Medication Log Retention (days)"
+        default 7
+        range 1 90
+        depends on ENABLE_MEDICATION_REMINDER_TASK
+        help
+            设备端服药剂量记录保留天数，超期自动清理。默认 7 天。
 
 endmenu
 

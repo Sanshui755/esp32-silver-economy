@@ -16,17 +16,17 @@
 
 注册位置：`main/boards/bread-compact-wifi-s3cam/compact_wifi_board_s3cam.cc` 的 `InitializeTools()` 中。所有工具按 AGENTS.md 规范在板级注册，不放在 mcp_server.cc。
 
-| #   | 工具名                     | 功能                  | 参数                          | 存储                     | 说明                                   |
-| --- | -------------------------- | --------------------- | ----------------------------- | ------------------------ | -------------------------------------- |
-| 6   | `self.medication_reminder` | 服药提醒增删查        | add / remove / list           | NVS `medication`         |                                        |
-| 7   | `self.fall_detection`      | 拍照+视觉分析是否跌倒 | 无                            | 无状态                   | 返回 `{fell, confidence, description}` |
-| 8   | `self.family_voice_board`  | 家属留言板（文字）    | add / list                    | NVS `voice_board`        |                                        |
-| 9   | `self.medication_log`      | 用药打卡记录          | checkin / status / list_today | NVS `medication`         | 与服药提醒配合，形成闭环               |
-| 10  | `self.schedule_reminder`   | 通用日程提醒          | add / remove / list           | NVS `reminders`          | 到点自动播报（需开 Kconfig）           |
-| 11  | `self.emergency_contact`   | 紧急联系人管理        | add / remove / list           | NVS `emergency_contacts` | SOS 触发时自动显示                     |
-| 12  | `self.find_item`           | 找东西（拍照+视觉）   | item_name                     | 无状态                   | 受 VisionGuard 互斥锁保护              |
-| 13  | `self.door_identification` | 门口来人识别          | 无                            | 无状态                   | 防诈骗，同上互斥锁                     |
-| 14  | `self.weather_query`       | 天气查询              | city（可选，默认自动定位）    | 无状态                   | wttr.in API，IP 自动定位               |
+| #   | 工具名                     | 功能                  | 参数                                             | 存储                     | 说明                                                                                                |
+| --- | -------------------------- | --------------------- | ------------------------------------------------ | ------------------------ | --------------------------------------------------------------------------------------------------- |
+| 6   | `self.medication_reminder` | 服药提醒增删查        | add / remove / list                              | NVS `medication`         |                                                                                                     |
+| 7   | `self.fall_detection`      | 拍照+视觉分析是否跌倒 | 无                                               | 无状态                   | 返回 `{fell, confidence, description}`                                                              |
+| 8   | `self.family_voice_board`  | 家属留言板（文字）    | add / list                                       | NVS `voice_board`        | 留言默认保留 3 天自动过期（`VOICE_BOARD_MSG_TTL_DAYS` 可调 1-30 天）                                  |
+| 9   | `self.medication_log`      | 用药打卡+依从性记录   | checkin / status / list_today / report / history | NVS `medication`         | 打卡记 `{medicine,time}`；report 返医嘱执行情况(taken/late/missed/pending+delay)；history 查近 7 天 |
+| 10  | `self.schedule_reminder`   | 通用日程提醒          | add / remove / list                              | NVS `reminders`          | 到点自动播报（需开 Kconfig）                                                                        |
+| 11  | `self.emergency_contact`   | 紧急联系人管理        | add / remove / list                              | NVS `emergency_contacts` | SOS 触发时自动显示                                                                                  |
+| 12  | `self.find_item`           | 找东西（拍照+视觉）   | item_name                                        | 无状态                   | 受 CameraLockGuard 摄像头互斥锁保护                                                                 |
+| 13  | `self.door_identification` | 门口来人识别          | 无                                               | 无状态                   | 防诈骗，同上互斥锁                                                                                  |
+| 14  | `self.weather_query`       | 天气查询              | city（可选，默认自动定位）                       | 无状态                   | wttr.in API，IP 自动定位                                                                            |
 
 ### 语音触发示例
 
@@ -43,21 +43,35 @@
 
 受 Kconfig 开关控制，位于 `main/Kconfig.projbuild` 的 "Silver Economy Demo" 菜单下。均依赖 `BOARD_TYPE_BREAD_COMPACT_WIFI_CAM`。
 
-| #   | Kconfig 开关                  | 功能         | 默认间隔                 | 依赖              |
-| --- | ----------------------------- | ------------ | ------------------------ | ----------------- |
-| A   | `ENABLE_BOARD_FALL_DETECTION` | 周期跌倒检测 | 60 秒                    | 摄像头 + 云端视觉 |
-| B   | `ENABLE_SCHEDULE_REMINDER`    | 日程到点播报 | 60 秒检查                | NVS `reminders`   |
-| C   | `ENABLE_SEDENTARY_REMINDER`   | 久坐提醒     | 30 分钟                  | 摄像头（可选）    |
-| D   | `ENABLE_BED_EXIT_DETECTION`   | 夜间离床告警 | 2 分钟检查 / 10 分钟超时 | 摄像头 + 云端视觉 |
+| #   | Kconfig 开关                      | 功能         | 默认间隔/规则                       | 依赖              |
+| --- | --------------------------------- | ------------ | ----------------------------------- | ----------------- |
+| A   | `ENABLE_BOARD_FALL_DETECTION`     | 周期跌倒检测 | 60 秒                               | 摄像头 + 云端视觉 |
+| B   | `ENABLE_SCHEDULE_REMINDER`        | 日程到点播报 | 60 秒检查                           | NVS `reminders`   |
+| C   | `ENABLE_SEDENTARY_REMINDER`       | 久坐提醒     | 30 分钟                             | 摄像头（可选）    |
+| D   | `ENABLE_BED_EXIT_DETECTION`       | 夜间离床告警 | 2 分钟检查 / 10 分钟超时            | 摄像头 + 云端视觉 |
+| E   | `ENABLE_MEDICATION_REMINDER_TASK` | 服药提醒闭环 | 60 秒检查；5 分钟×3 次；30 分钟漏服 | 不依赖摄像头      |
+
+### 服药提醒闭环（任务 E）
+
+完整链路：医嘱计划（`self.medication_reminder` 增删查）→ 后台任务到点弹窗+三声提示音（同时向云端发 `medication_due` 通知，服务器配自动化可触发语音询问）→ 未打卡每 5 分钟再提醒，最多 3 次 → 超 30 分钟未打卡判 `missed` 漏服并弹漏服告警（发 `medication_missed`）→ 老人说"我吃过XX了"打卡（漏服后补卡记为 `late` 迟服）→ report/history 查询。
+
+NVS `medication` 命名空间：
+- `reminders`：医嘱计划 `[{time, medicine}]`
+- `logs`：打卡事件流 `{"YYYY-MM-DD":[{medicine, time}]}`
+- `dYYYYMMDD`：当日剂量状态数组 `[{medicine, planned, status, reminds, actual, delay}]`，自动清理 7 天前数据
 
 ### Kconfig 可调参数
 
-| 配置项                           | 类型 | 默认值  | 范围           | 说明                     |
-| -------------------------------- | ---- | ------- | -------------- | ------------------------ |
-| `BOARD_FALL_DETECTION_PERIOD_MS` | int  | 60000   | 30000~3600000  | 跌倒检测间隔（毫秒）     |
-| `SEDENTARY_REMINDER_PERIOD_MS`   | int  | 1800000 | 600000~7200000 | 久坐提醒间隔（毫秒）     |
-| `BED_EXIT_CHECK_PERIOD_MS`       | int  | 120000  | 30000~600000   | 离床检测拍照间隔（毫秒） |
-| `BED_EXIT_EMPTY_TIMEOUT_S`       | int  | 600     | 60~3600        | 床上连续无人超时（秒）   |
+| 配置项                             | 类型 | 默认值  | 范围           | 说明                     |
+| ---------------------------------- | ---- | ------- | -------------- | ------------------------ |
+| `BOARD_FALL_DETECTION_PERIOD_MS`   | int  | 60000   | 30000~3600000  | 跌倒检测间隔（毫秒）     |
+| `SEDENTARY_REMINDER_PERIOD_MS`     | int  | 1800000 | 600000~7200000 | 久坐提醒间隔（毫秒）     |
+| `BED_EXIT_CHECK_PERIOD_MS`         | int  | 120000  | 30000~600000   | 离床检测拍照间隔（毫秒） |
+| `BED_EXIT_EMPTY_TIMEOUT_S`         | int  | 600     | 60~3600        | 床上连续无人超时（秒）   |
+| `MEDICATION_REMIND_REPEAT_MINUTES` | int  | 5       | 1~60           | 服药重复提醒间隔（分钟） |
+| `MEDICATION_REMIND_MAX_TIMES`      | int  | 3       | 1~10           | 每条计划最多提醒次数     |
+| `MEDICATION_MISSED_TIMEOUT_MIN`    | int  | 30      | 5~240          | 漏服判定时限（分钟）     |
+| `MEDICATION_LOG_KEEP_DAYS`         | int  | 7       | 1~90           | 剂量记录保留天数         |
 
 ## 五、SOS 硬件按键
 
@@ -94,10 +108,10 @@ ESP32-S3-N16R8 上大部分 GPIO 已被摄像头 DVP、显示屏 SPI、I2S 音�
 
 ## 七、板级关键设计
 
-### VisionGuard 互斥锁
+### CameraLockGuard 摄像头互斥锁
 
-6 个视觉调用点（3 个 MCP 工具 + 3 个后台任务）共享摄像头，通过 RAII 互斥锁防止并发冲突：
-- MCP 工具拿不到锁：立即返回"摄像头正忙，请几秒后再试"
+7 个视觉调用点（内置 take_photo + 3 个板级 MCP 工具 + 3 个后台任务）共享摄像头，通过 Camera 基类的 TryLock/Unlock + RAII 守卫防止并发冲突（摄像头仅 1 个帧缓冲区，并发会导致 cam_hal 超时和硬件卡死）：
+- MCP 工具（含内置 take_photo）拿不到锁：立即返回"摄像头正忙，请几秒后再试"
 - 后台任务拿不到锁：静默跳过本轮，日志 `camera busy, skip this round`
 
 ### 提醒音三声连响
