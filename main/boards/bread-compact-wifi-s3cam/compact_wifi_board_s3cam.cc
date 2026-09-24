@@ -197,6 +197,36 @@ static void ShowElderAlert(const char* title, const char* message,
 }
 
 // ------------------------------------------------------------------
+// 从数组中摘除并释放节点。
+// 必须用库函数摘链：本仓库的 espressif cJSON fork 为 O(1) 尾插，把数组
+// 首元素的 prev 当作尾指针（指向自身），与上游 cJSON（首元素 prev==NULL）
+// 不同。若手动按上游约定改链，删除唯一/首个元素时会漏掉 parent->child
+// 更新，留下悬垂指针，随后 Print 返回 NULL、Delete 访问 0xfefefefe 崩溃。
+// ------------------------------------------------------------------
+static void UnlinkAndDeleteItem(cJSON* root, cJSON* elem) {
+    cJSON* detached = cJSON_DetachItemViaPointer(root, elem);
+    if (detached != nullptr) {
+        cJSON_Delete(detached);
+    }
+}
+
+// ------------------------------------------------------------------
+// 序列化并写回 NVS。cJSON_PrintUnformatted 失败（树被破坏或内存不足）
+// 时返回 false 并打 E 级日志；绝不把 nullptr 交给 std::string，
+// 否则抛 logic_error 直接 abort 重启。
+// ------------------------------------------------------------------
+static bool StoreJson(Settings& settings, const char* what, const char* key, cJSON* root) {
+    char* out = cJSON_PrintUnformatted(root);
+    if (out == nullptr) {
+        ESP_LOGE(TAG, "%s: serialize failed, key=%s", what, key);
+        return false;
+    }
+    settings.SetString(key, out);
+    free(out);
+    return true;
+}
+
+// ------------------------------------------------------------------
 // 留言板过期清理：删除 epoch 距今超过保留期（VOICE_BOARD_MSG_TTL_DAYS
 // 天，默认 3）的留言；无 epoch 字段的旧格式留言一并清理。
 // 系统时间未同步时跳过清理。返回删除条数。
@@ -441,26 +471,31 @@ private:
                         cJSON_Delete(root);
                         return std::unexpected("time is required for 'remove'");
                     }
-                    cJSON* new_arr = cJSON_CreateArray();
-                    cJSON* elem = nullptr;
-                    cJSON_ArrayForEach(elem, root) {
+                    // 原地删除匹配项；不能用 AddItemReferenceToArray+Delete(root)，
+                    // 引用会悬垂导致 PrintUnformatted 访问已释放内存
+                    cJSON* elem = root->child;
+                    while (elem != nullptr) {
+                        cJSON* next = elem->next;
                         cJSON* t = cJSON_GetObjectItem(elem, "time");
-                        if (t == nullptr || !cJSON_IsString(t) ||
-                            strcmp(t->valuestring, time.c_str()) != 0) {
-                            cJSON_AddItemReferenceToArray(new_arr, elem);
+                        if (t != nullptr && cJSON_IsString(t) &&
+                            strcmp(t->valuestring, time.c_str()) == 0) {
+                            UnlinkAndDeleteItem(root, elem);
                         }
+                        elem = next;
                     }
-                    cJSON_Delete(root);
-                    root = new_arr;
                 } else if (action != "list") {
                     cJSON_Delete(root);
                     return std::unexpected("Unknown action: " + action);
                 }
 
                 if (action != "list") {
-                    char* out = cJSON_PrintUnformatted(root);
-                    settings.SetString("reminders", out);
-                    free(out);
+                    if (!StoreJson(settings, "medication_reminder", "reminders", root)) {
+                        // 序列化失败：NVS 内容或堆已异常，报错而不是重启
+                        ESP_LOGE(TAG, "medication_reminder: stored=%s", stored.c_str());
+                        cJSON_Delete(root);
+                        return std::unexpected(
+                            "internal error: reminders data corrupted, storage reset");
+                    }
                 }
                 return root;
             });
@@ -493,7 +528,10 @@ private:
                     "\"description\": 简短描述}";
                 auto result = camera->Explain(prompt);
                 if (!result) {
-                    return std::unexpected(std::move(result.error()));
+                    // 拍照已成功且照片已在屏幕显示（Capture 内部完成）；
+                    // 上传失败时返回说明而非错误，避免掩盖拍照成功的事实
+                    return std::string("照片已拍摄并显示在屏幕上，但上传云端分析失败：") +
+                           result.error();
                 }
                 return std::move(*result);
             });
@@ -532,9 +570,7 @@ private:
 
                 // 过期留言自动清理：有删除则立即写回 NVS
                 if (PurgeExpiredVoiceMessages(root) > 0) {
-                    char* out = cJSON_PrintUnformatted(root);
-                    settings.SetString("messages", out);
-                    free(out);
+                    StoreJson(settings, "family_voice_board", "messages", root);
                 }
 
                 if (action == "add") {
@@ -556,9 +592,7 @@ private:
                     cJSON_AddStringToObject(item, "time", time_buf);
                     cJSON_AddNumberToObject(item, "epoch", (double)now);
                     cJSON_AddItemToArray(root, item);
-                    char* out = cJSON_PrintUnformatted(root);
-                    settings.SetString("messages", out);
-                    free(out);
+                    StoreJson(settings, "family_voice_board", "messages", root);
                     return root;
                 }
 
@@ -666,9 +700,7 @@ private:
                     cJSON_ArrayForEach(elem, day_arr) {
                         const char* name = elem_medicine(elem);
                         if (name != nullptr && strcmp(name, medicine.c_str()) == 0) {
-                            char* out = cJSON_PrintUnformatted(root);
-                            settings.SetString("logs", out);
-                            free(out);
+                            StoreJson(settings, "medication_log", "logs", root);
                             return root;
                         }
                     }
@@ -676,9 +708,7 @@ private:
                     cJSON_AddStringToObject(record, "medicine", medicine.c_str());
                     cJSON_AddStringToObject(record, "time", time_valid ? clock : "unknown");
                     cJSON_AddItemToArray(day_arr, record);
-                    char* out = cJSON_PrintUnformatted(root);
-                    settings.SetString("logs", out);
-                    free(out);
+                    StoreJson(settings, "medication_log", "logs", root);
 #ifdef CONFIG_ENABLE_MEDICATION_REMINDER_TASK
                     // 联动当日医嘱剂量状态：pending -> taken，missed -> late
                     if (time_valid) {
@@ -807,9 +837,7 @@ private:
                     cJSON_AddStringToObject(item, "time", time.c_str());
                     cJSON_AddStringToObject(item, "content", content.c_str());
                     cJSON_AddItemToArray(root, item);
-                    char* out = cJSON_PrintUnformatted(root);
-                    settings.SetString("reminders", out);
-                    free(out);
+                    StoreJson(settings, "schedule_reminder", "reminders", root);
                     return root;
                 }
 
@@ -818,20 +846,19 @@ private:
                         cJSON_Delete(root);
                         return std::unexpected("time is required for 'remove'");
                     }
-                    cJSON* new_arr = cJSON_CreateArray();
-                    cJSON* elem = nullptr;
-                    cJSON_ArrayForEach(elem, root) {
+                    // 原地删除匹配项；不能用 AddItemReferenceToArray+Delete(root)，
+                    // 引用会悬垂导致 PrintUnformatted 访问已释放内存
+                    cJSON* elem = root->child;
+                    while (elem != nullptr) {
+                        cJSON* next = elem->next;
                         cJSON* t = cJSON_GetObjectItem(elem, "time");
-                        if (t == nullptr || !cJSON_IsString(t) ||
-                            strcmp(t->valuestring, time.c_str()) != 0) {
-                            cJSON_AddItemReferenceToArray(new_arr, elem);
+                        if (t != nullptr && cJSON_IsString(t) &&
+                            strcmp(t->valuestring, time.c_str()) == 0) {
+                            UnlinkAndDeleteItem(root, elem);
                         }
+                        elem = next;
                     }
-                    cJSON_Delete(root);
-                    root = new_arr;
-                    char* out = cJSON_PrintUnformatted(root);
-                    settings.SetString("reminders", out);
-                    free(out);
+                    StoreJson(settings, "schedule_reminder", "reminders", root);
                     return root;
                 }
 
@@ -884,9 +911,7 @@ private:
                     cJSON_AddStringToObject(item, "relation", relation.c_str());
                     cJSON_AddStringToObject(item, "phone", phone.c_str());
                     cJSON_AddItemToArray(root, item);
-                    char* out = cJSON_PrintUnformatted(root);
-                    settings.SetString("list", out);
-                    free(out);
+                    StoreJson(settings, "emergency_contact", "list", root);
                     return root;
                 }
 
@@ -895,20 +920,19 @@ private:
                         cJSON_Delete(root);
                         return std::unexpected("name is required for 'remove'");
                     }
-                    cJSON* new_arr = cJSON_CreateArray();
-                    cJSON* elem = nullptr;
-                    cJSON_ArrayForEach(elem, root) {
+                    // 原地删除匹配项；不能用 AddItemReferenceToArray+Delete(root)，
+                    // 引用会悬垂导致 PrintUnformatted 访问已释放内存
+                    cJSON* elem = root->child;
+                    while (elem != nullptr) {
+                        cJSON* next = elem->next;
                         cJSON* n = cJSON_GetObjectItem(elem, "name");
-                        if (n == nullptr || !cJSON_IsString(n) ||
-                            strcmp(n->valuestring, name.c_str()) != 0) {
-                            cJSON_AddItemReferenceToArray(new_arr, elem);
+                        if (n != nullptr && cJSON_IsString(n) &&
+                            strcmp(n->valuestring, name.c_str()) == 0) {
+                            UnlinkAndDeleteItem(root, elem);
                         }
+                        elem = next;
                     }
-                    cJSON_Delete(root);
-                    root = new_arr;
-                    char* out = cJSON_PrintUnformatted(root);
-                    settings.SetString("list", out);
-                    free(out);
+                    StoreJson(settings, "emergency_contact", "list", root);
                     return root;
                 }
 
@@ -957,14 +981,9 @@ private:
                     "请用简短的中文回答。";
                 auto result = camera->Explain(prompt);
                 if (!result) {
-                    std::string err = result.error();
-                    // 服务器限流（429）时给 AI 一个可转述的友好提示
-                    if (err.find("Failed to upload photo") != std::string::npos) {
-                        return std::unexpected(
-                            "Photo service is rate limited, please tell the user to wait "
-                            "tens of seconds and try again");
-                    }
-                    return std::unexpected(err);
+                    // 拍照已成功且照片已在屏幕显示；上传失败（含 429 限流）告知而非报错
+                    return std::string("照片已拍摄并显示在屏幕上，但上传云端分析失败：") +
+                           result.error();
                 }
                 // Explain 返回的是信封 JSON，取 text 字段
                 std::string model_text;
@@ -1008,14 +1027,9 @@ private:
                     "请用简短的中文回答。";
                 auto result = camera->Explain(prompt);
                 if (!result) {
-                    std::string err = result.error();
-                    // 服务器限流（429）时给 AI 一个可转述的友好提示
-                    if (err.find("Failed to upload photo") != std::string::npos) {
-                        return std::unexpected(
-                            "Photo service is rate limited, please tell the user to wait "
-                            "tens of seconds and try again");
-                    }
-                    return std::unexpected(err);
+                    // 拍照已成功且照片已在屏幕显示；上传失败（含 429 限流）告知而非报错
+                    return std::string("照片已拍摄并显示在屏幕上，但上传云端分析失败：") +
+                           result.error();
                 }
                 std::string model_text;
                 cJSON* envelope = cJSON_Parse(result->c_str());
@@ -1424,9 +1438,7 @@ private:
         cJSON_ReplaceItemInObject(target, "actual", cJSON_CreateString(clock));
         cJSON_ReplaceItemInObject(target, "delay", cJSON_CreateNumber(delay));
 
-        char* out = cJSON_PrintUnformatted(doses);
-        settings.SetString(key, out);
-        free(out);
+        StoreJson(settings, "medication_checkin", key.c_str(), doses);
         cJSON_Delete(doses);
         ESP_LOGI(TAG, "medication: checkin %s -> %s, delay=%d min", medicine.c_str(),
                  new_status, delay);
@@ -1563,8 +1575,12 @@ private:
             cJSON_AddStringToObject(msg, "medicine", medicine.c_str());
             cJSON_AddStringToObject(msg, "planned", planned.c_str());
             char* out = cJSON_PrintUnformatted(msg);
-            Application::GetInstance().SendMcpMessage(out);
-            free(out);
+            if (out != nullptr) {
+                Application::GetInstance().SendMcpMessage(out);
+                free(out);
+            } else {
+                ESP_LOGE(TAG, "medication_due: serialize failed");
+            }
             cJSON_Delete(msg);
         });
     }
@@ -1581,8 +1597,12 @@ private:
             cJSON_AddStringToObject(msg, "medicine", medicine.c_str());
             cJSON_AddStringToObject(msg, "planned", planned.c_str());
             char* out = cJSON_PrintUnformatted(msg);
-            Application::GetInstance().SendMcpMessage(out);
-            free(out);
+            if (out != nullptr) {
+                Application::GetInstance().SendMcpMessage(out);
+                free(out);
+            } else {
+                ESP_LOGE(TAG, "medication_missed: serialize failed");
+            }
             cJSON_Delete(msg);
         });
     }
@@ -1654,9 +1674,7 @@ private:
         }
         if (plans) cJSON_Delete(plans);
         if (changed) {
-            char* out = cJSON_PrintUnformatted(doses);
-            settings.SetString(key, out);
-            free(out);
+            StoreJson(settings, "medication_task", key.c_str(), doses);
         }
 
         // 2. 清理过期记录（保留 CONFIG_MEDICATION_LOG_KEEP_DAYS 天）
@@ -1692,9 +1710,7 @@ private:
                 cJSON_ReplaceItemInObject(elem, "status", cJSON_CreateString("missed"));
                 cJSON_ReplaceItemInObject(elem, "delay",
                                           cJSON_CreateNumber(delta));
-                char* out = cJSON_PrintUnformatted(doses);
-                settings.SetString(key, out);
-                free(out);
+                StoreJson(settings, "medication_task", key.c_str(), doses);
                 ESP_LOGW(TAG, "medication: MISSED %s planned=%s", medicine.c_str(),
                          planned_hm.c_str());
                 FireMedicationMissed(medicine, planned_hm);
@@ -1712,9 +1728,7 @@ private:
             if (reminds < expected) {
                 cJSON_ReplaceItemInObject(elem, "reminds",
                                           cJSON_CreateNumber(expected));
-                char* out = cJSON_PrintUnformatted(doses);
-                settings.SetString(key, out);
-                free(out);
+                StoreJson(settings, "medication_task", key.c_str(), doses);
                 ESP_LOGI(TAG, "medication: remind #%d for %s planned=%s", expected,
                          medicine.c_str(), planned_hm.c_str());
                 FireMedicationDue(medicine, planned_hm, expected);
