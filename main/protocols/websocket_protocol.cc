@@ -1,5 +1,5 @@
 #include "websocket_protocol.h"
-#include "application.h"
+#include "audio_service.h"
 #include "board.h"
 #include "settings.h"
 #include "system_info.h"
@@ -14,7 +14,10 @@
 
 WebsocketProtocol::WebsocketProtocol() { event_group_handle_ = xEventGroupCreate(); }
 
-WebsocketProtocol::~WebsocketProtocol() { vEventGroupDelete(event_group_handle_); }
+WebsocketProtocol::~WebsocketProtocol() {
+    StopPingTask();
+    vEventGroupDelete(event_group_handle_);
+}
 
 bool WebsocketProtocol::Start() {
     // Only connect to server when audio channel is needed
@@ -73,10 +76,18 @@ bool WebsocketProtocol::IsAudioChannelOpened() const {
 
 void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
     (void)send_goodbye;  // Websocket doesn't need to send goodbye message
+    StopPingTask();
     websocket_.reset();
 }
 
 bool WebsocketProtocol::OpenAudioChannel() {
+    // 确保旧的 WebSocket 连接被正确清理
+    if (websocket_ != nullptr) {
+        StopPingTask();
+        websocket_.reset();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
     Settings settings("websocket", false);
     std::string url = settings.GetString("url");
     std::string token = settings.GetString("token");
@@ -160,6 +171,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
 
     websocket_->OnDisconnected([this]() {
         ESP_LOGI(TAG, "Websocket disconnected");
+        StopPingTask();
         if (on_audio_channel_closed_ != nullptr) {
             on_audio_channel_closed_();
         }
@@ -192,6 +204,10 @@ bool WebsocketProtocol::OpenAudioChannel() {
     if (on_audio_channel_opened_ != nullptr) {
         on_audio_channel_opened_();
     }
+
+    // 连接建立后启动保活任务，每 30 秒发送一次 Ping，
+    // 防止服务器（Tomcat 默认 60 秒）因 idle timeout 主动关闭连接
+    StartPingTask();
 
     return true;
 }
@@ -248,4 +264,55 @@ void WebsocketProtocol::ParseServerHello(const cJSON* root) {
     }
 
     xEventGroupSetBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT);
+}
+
+void WebsocketProtocol::PingTask(void* arg) {
+    WebsocketProtocol* self = static_cast<WebsocketProtocol*>(arg);
+    TaskHandle_t self_handle = xTaskGetCurrentTaskHandle();
+    // 连接刚建立时已有 hello 交互，先等一个周期再开始 ping，避免与握手争抢。
+    // 用 ulTaskNotifyTake 兼作定时器与退出信号：超时返回 0 表示该发 ping；
+    // 收到通知（返回非 0）表示 StopPingTask 要求退出。
+    while (self->ping_running_) {
+        uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(PING_INTERVAL_MS));
+        if (notified != 0 || !self->ping_running_) {
+            break;
+        }
+        // websocket_ 可能被其他线程 reset，这里使用前必须判空
+        if (self->websocket_ != nullptr && self->websocket_->IsConnected()) {
+            self->websocket_->Ping();
+        } else {
+            // 连接已断开，任务自行退出
+            break;
+        }
+    }
+    // 只有当 handle 仍是自己时才清空，避免覆盖新启动的任务
+    if (self->ping_task_handle_ == self_handle) {
+        self->ping_task_handle_ = nullptr;
+    }
+    vTaskDelete(nullptr);
+}
+
+void WebsocketProtocol::StartPingTask() {
+    if (ping_task_handle_ != nullptr) {
+        // 已有任务在跑，避免重复创建
+        return;
+    }
+    ping_running_ = true;
+    BaseType_t ret = xTaskCreate(PingTask, "ws_ping", 2048, this, 1, &ping_task_handle_);
+    if (ret != pdPASS) {
+        ESP_LOGW(TAG, "Failed to create ping task, server idle timeout may close connection");
+        ping_running_ = false;
+        ping_task_handle_ = nullptr;
+    }
+}
+
+void WebsocketProtocol::StopPingTask() {
+    ping_running_ = false;
+    TaskHandle_t handle = ping_task_handle_;
+    if (handle != nullptr) {
+        ping_task_handle_ = nullptr;
+        // 通过 task notification 唤醒可能在 ulTaskNotifyTake 中睡眠的 ping 任务，
+        // 让它立刻检查 ping_running_ 并退出。不阻塞等待，避免与主任务互相等死。
+        xTaskNotify(handle, 1, eSetValueWithOverwrite);
+    }
 }

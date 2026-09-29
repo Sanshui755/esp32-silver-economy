@@ -6,8 +6,11 @@
 #include <esp_log.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <strings.h>
+#include <cctype>
 #include <cstring>
 #include "assets/lang_config.h"
+
 
 #define TAG "MQTT"
 
@@ -148,12 +151,41 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
 
     std::string broker_address;
     int broker_port = 8883;
-    size_t pos = endpoint.find(':');
+
+    // The endpoint comes from the OTA response and may carry a scheme,
+    // e.g. "tcp://192.168.1.10:1883". Strip it before splitting host and port.
+    static const char* kSchemes[] = {"tcp://", "mqtt://", "ssl://", "mqtts://", "ws://", "wss://"};
+    std::string host_port = endpoint;
+    for (const char* scheme : kSchemes) {
+        size_t scheme_len = std::strlen(scheme);
+        if (host_port.size() >= scheme_len &&
+            strncasecmp(host_port.c_str(), scheme, scheme_len) == 0) {
+            host_port.erase(0, scheme_len);
+            break;
+        }
+    }
+
+    // Use the last colon so IPv6-style or scheme-prefixed inputs parse correctly.
+    size_t pos = host_port.rfind(':');
     if (pos != std::string::npos) {
-        broker_address = endpoint.substr(0, pos);
-        broker_port = std::stoi(endpoint.substr(pos + 1));
+        std::string port_str = host_port.substr(pos + 1);
+        bool port_valid = !port_str.empty();
+        for (char ch : port_str) {
+            if (!std::isdigit(static_cast<unsigned char>(ch))) {
+                port_valid = false;
+                break;
+            }
+        }
+        if (port_valid) {
+            broker_address = host_port.substr(0, pos);
+            broker_port = std::stoi(port_str);
+        } else {
+            ESP_LOGW(TAG, "Invalid broker port in endpoint '%s', falling back to %d",
+                     endpoint.c_str(), broker_port);
+            broker_address = host_port;
+        }
     } else {
-        broker_address = endpoint;
+        broker_address = host_port;
     }
     ESP_LOGI(TAG, "Connecting to endpoint %s:%d", broker_address.c_str(), broker_port);
     if (Board::GetInstance().GetBoardType() == "wifi") {
