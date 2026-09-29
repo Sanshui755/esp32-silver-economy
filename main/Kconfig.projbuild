@@ -929,6 +929,21 @@ config CUSTOM_WAKE_WORD_THRESHOLD
     help
         Custom Wake Word Threshold, range 1-99, the smaller the more sensitive, default 20
 
+config CUSTOM_WAKE_WORD_2
+    string "Custom Wake Word 2 (optional)"
+    default ""
+    depends on USE_CUSTOM_WAKE_WORD
+    help
+        Optional second custom wake word, use pinyin for Chinese, separated by spaces.
+        Leave empty to use only the first wake word.
+
+config CUSTOM_WAKE_WORD_DISPLAY_2
+    string "Custom Wake Word 2 Display"
+    default ""
+    depends on USE_CUSTOM_WAKE_WORD
+    help
+        Display text for the second wake word. Must be set together with CUSTOM_WAKE_WORD_2.
+
 config SEND_WAKE_WORD_DATA
     bool "Send Wake Word Data"
     default y
@@ -1264,6 +1279,40 @@ menu "Silver Economy Demo"
         depends on ENABLE_MEDICATION_REMINDER_TASK
         help
             设备端服药剂量记录保留天数，超期自动清理。默认 7 天。
+
+    config ENABLE_CARE_SYNC
+        bool "Enable Care Cloud Sync (Board)"
+        default y
+        depends on BOARD_TYPE_BREAD_COMPACT_WIFI_CAM
+        help
+            启用与服务端老年关怀模块的 REST 同步（依据服务端
+            /api/device/care/* 设备端接口，Device-Id=MAC 鉴权）：
+            - 双向同步服药计划（后台添加的计划拉取到设备，
+              设备语音设置的计划上报到后台，两端同一份数据）
+            - 服药打卡上报后台 medication_record
+            - 定时拉取家属关怀留言到留言板（代替 MQTT 订阅）
+            - 拉取老人档案（姓名/健康备注），SOS 告警播报老人姓名
+            服务端地址从 OTA URL 推导（同主机同端口）。
+
+    config CARE_SYNC_PERIOD_MINUTES
+        int "Care Sync Pull Interval (minutes)"
+        default 5
+        range 1 120
+        depends on ENABLE_CARE_SYNC
+        help
+            关怀云端数据（服药计划/关怀留言/老人档案）的定时拉取间隔。
+            默认 5 分钟；开机后 10 秒先拉取一次。
+
+    config CARE_API_BASE
+        string "Care API Base URL"
+        default ""
+        depends on ENABLE_CARE_SYNC
+        help
+            关怀云同步 REST API 基地址（如 http://192.168.0.33:8091）。
+            留空则从 OTA URL 推导（同主机同端口）。
+            当 OTA 指向公共服务器（如 api.tenclass.net）而关怀
+            API 在自建服务器上时，必须填写此项，否则所有 care
+            请求将 404 并浪费数十秒 HTTPS 握手时间。
 
 endmenu
 

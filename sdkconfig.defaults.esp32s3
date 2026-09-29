@@ -19,7 +19,16 @@ CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
 CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 
-CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y
+# Wake word: MultiNet custom wake words (你好小智 + 你好小何)
+# CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS is not set
+CONFIG_USE_AFE_WAKE_WORD=n
+CONFIG_USE_CUSTOM_WAKE_WORD=y
+CONFIG_SR_MN_CN_MULTINET7_QUANT=y
+CONFIG_CUSTOM_WAKE_WORD="ni hao xiao zhi"
+CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好小智"
+CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=5
+CONFIG_CUSTOM_WAKE_WORD_2="ni hao xiao he"
+CONFIG_CUSTOM_WAKE_WORD_DISPLAY_2="你好小何"
 
 # Keep the camera DMA bounce buffer out of internal SRAM so AFE/WakeNet10
 # still has a usable internal heap after boot.
@@ -28,6 +37,12 @@ CONFIG_CAMERA_PSRAM_DMA=y
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1536
+
+# Care sync API base (local server, NOT api.tenclass.net)
+CONFIG_CARE_API_BASE="http://192.168.0.33:8091"
+
+# OTA endpoint on local server (returns websocket config, not mqtt)
+CONFIG_OTA_URL="http://192.168.0.33:8091/api/device/ota/"
 
 # LVGL Graphics
 CONFIG_LV_USE_SNAPSHOT=y

@@ -641,14 +641,14 @@ def read_custom_wake_word_from_sdkconfig(sdkconfig_path):
     if not os.path.exists(sdkconfig_path):
         print(f"Warning: sdkconfig file not found: {sdkconfig_path}")
         return None
-        
+
     config_values = {}
     with io.open(sdkconfig_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip("\n")
             if line.startswith('#') or '=' not in line:
                 continue
-                
+
             # Check for custom wake word configuration
             if 'CONFIG_USE_CUSTOM_WAKE_WORD=y' in line:
                 config_values['use_custom_wake_word'] = True
@@ -671,18 +671,31 @@ def read_custom_wake_word_from_sdkconfig(sdkconfig_path):
                     except ValueError:
                         print(f"Warning: Invalid threshold value: {value}")
                         config_values['threshold'] = 20  # default (will be converted to 0.2)
-    
+            elif 'CONFIG_CUSTOM_WAKE_WORD_2=' in line and not line.startswith('#'):
+                value = line.split('=', 1)[1].strip('"')
+                config_values['wake_word_2'] = value
+            elif 'CONFIG_CUSTOM_WAKE_WORD_DISPLAY_2=' in line and not line.startswith('#'):
+                value = line.split('=', 1)[1].strip('"')
+                config_values['display_2'] = value
+
     # Return config only if custom wake word is enabled and required fields are present
-    if (config_values.get('use_custom_wake_word', False) and 
-        'wake_word' in config_values and 
-        'display' in config_values and 
+    if (config_values.get('use_custom_wake_word', False) and
+        'wake_word' in config_values and
+        'display' in config_values and
         'threshold' in config_values):
-        return {
+        result = {
             'wake_word': config_values['wake_word'],
             'display': config_values['display'],
             'threshold': config_values['threshold'] / 100.0  # Convert to decimal (20 -> 0.2)
         }
-    
+        # Add second wake word if both pinyin and display are non-empty
+        ww2 = config_values.get('wake_word_2', '').strip()
+        disp2 = config_values.get('display_2', '').strip()
+        if ww2 and disp2:
+            result['wake_word_2'] = ww2
+            result['display_2'] = disp2
+        return result
+
     return None
 
 
@@ -979,21 +992,33 @@ def main():
     if custom_wake_word_config and multinet_model_paths:
         # Determine language from multinet models
         language = get_language_from_multinet_models(multinet_model_names)
-        
+
+        # Build commands list (always include first wake word)
+        commands = [
+            {
+                "command": custom_wake_word_config['wake_word'],
+                "text": custom_wake_word_config['display'],
+                "action": "wake"
+            }
+        ]
+        # Append second wake word if configured
+        if 'wake_word_2' in custom_wake_word_config:
+            commands.append({
+                "command": custom_wake_word_config['wake_word_2'],
+                "text": custom_wake_word_config['display_2'],
+                "action": "wake"
+            })
+
         # Build multinet_model info structure
         multinet_model_info = {
             "language": language,
             "duration": 3000,  # Default duration in ms
             "threshold": custom_wake_word_config['threshold'],
-            "commands": [
-                {
-                    "command": custom_wake_word_config['wake_word'],
-                    "text": custom_wake_word_config['display'],
-                    "action": "wake"
-                }
-            ]
+            "commands": commands
         }
         print(f"  custom wake word: {custom_wake_word_config['wake_word']} ({custom_wake_word_config['display']})")
+        if 'wake_word_2' in custom_wake_word_config:
+            print(f"  custom wake word 2: {custom_wake_word_config['wake_word_2']} ({custom_wake_word_config['display_2']})")
         print(f"  wake word language: {language}")
         print(f"  wake word threshold: {custom_wake_word_config['threshold']}")
     
