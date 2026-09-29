@@ -116,8 +116,9 @@ void McpServer::AddCommonTools() {
                     if (!result) {
                         // The photo was already shown on screen by Capture();
                         // report the upload failure instead of masking the success.
-                        return std::string("Photo captured and displayed on screen, but failed "
-                                           "to upload for analysis: ") +
+                        return std::string(
+                                   "Photo captured and displayed on screen, but failed "
+                                   "to upload for analysis: ") +
                                result.error();
                     }
                     return std::move(*result);

@@ -1,28 +1,31 @@
-#include "wifi_board.h"
-#include "codecs/no_audio_codec.h"
-#include "display/lcd_display.h"
-#include "system_reset.h"
 #include "application.h"
-#include "button.h"
-#include "config.h"
-#include "mcp_server.h"
-#include "lamp_controller.h"
-#include "led/single_led.h"
-#include "esp32_camera.h"
-#include "settings.h"
 #include "assets/lang_config.h"
+#include "button.h"
+#include "codecs/no_audio_codec.h"
+#include "config.h"
+#include "display/lcd_display.h"
+#include "esp32_camera.h"
+#include "led/single_led.h"
+#include "mcp_server.h"
+#include "settings.h"
+#include "system_info.h"
+#include "wifi_board.h"
 
-#include <esp_log.h>
-#include <atomic>
-#include <cstdio>
-#include <ctime>
-#include <cstring>
 #include <driver/i2c_master.h>
-#include <esp_lcd_panel_vendor.h>
+#include <driver/spi_common.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
-#include <driver/spi_common.h>
+#include <esp_lcd_panel_vendor.h>
+#include <esp_log.h>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <atomic>  // IWYU pragma: keep (条件编译的跌倒/久坐/离床周期任务启用时使用)
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <utility>
+#include <vector>
 
 #if defined(LCD_TYPE_ILI9341_SERIAL)
 #include "esp_lcd_ili9341.h"
@@ -53,18 +56,18 @@ static const gc9a01_lcd_init_cmd_t gc9107_lcd_init_cmds[] = {
     {0xc6, (uint8_t[]){0x21}, 1, 0},
     {0xc7, (uint8_t[]){0x15}, 1, 0},
     {0xf0,
-    (uint8_t[]){0x1D, 0x38, 0x09, 0x4D, 0x92, 0x2F, 0x35, 0x52, 0x1E, 0x0C,
-                0x04, 0x12, 0x14, 0x1f},
-    14, 0},
+     (uint8_t[]){0x1D, 0x38, 0x09, 0x4D, 0x92, 0x2F, 0x35, 0x52, 0x1E, 0x0C, 0x04, 0x12, 0x14,
+                 0x1f},
+     14, 0},
     {0xf1,
-    (uint8_t[]){0x16, 0x40, 0x1C, 0x54, 0xA9, 0x2D, 0x2E, 0x56, 0x10, 0x0D,
-                0x0C, 0x1A, 0x14, 0x1E},
-    14, 0},
+     (uint8_t[]){0x16, 0x40, 0x1C, 0x54, 0xA9, 0x2D, 0x2E, 0x56, 0x10, 0x0D, 0x0C, 0x1A, 0x14,
+                 0x1E},
+     14, 0},
     {0xf4, (uint8_t[]){0x00, 0x00, 0xFF}, 3, 0},
     {0xba, (uint8_t[]){0xFF, 0xFF}, 2, 0},
 };
 #endif
- 
+
 #define TAG "CompactWifiBoardS3Cam"
 
 // ------------------------------------------------------------------
@@ -110,19 +113,18 @@ static void ElderAlertFire(void* arg) {
         state->beeps_left--;
         need_more = true;
         const std::string_view* sound = state->sound;
-        Application::GetInstance().Schedule([sound]() {
-            Application::GetInstance().PlaySound(*sound);
-        });
+        Application::GetInstance().Schedule(
+            [sound]() { Application::GetInstance().PlaySound(*sound); });
     }
 
     // 字符串按值拷入 lambda：最后一次触发会 delete state，避免悬垂
-    Application::GetInstance().Schedule([t = state->title, m = state->message,
-                                         e = state->emotion]() {
-        auto display = Board::GetInstance().GetDisplay();
-        display->SetStatus(t.c_str());
-        display->SetEmotion(e.c_str());
-        display->SetChatMessage("system", m.c_str());
-    });
+    Application::GetInstance().Schedule(
+        [t = state->title, m = state->message, e = state->emotion]() {
+            auto display = Board::GetInstance().GetDisplay();
+            display->SetStatus(t.c_str());
+            display->SetEmotion(e.c_str());
+            display->SetChatMessage("system", m.c_str());
+        });
 
     if (state->reasserts_left > 0) {
         state->reasserts_left--;
@@ -151,7 +153,8 @@ static void RestoreVolumeLater(int volume, int delay_ms) {
         delete static_cast<int*>(arg);
         Application::GetInstance().Schedule([v = vol]() {
             auto* codec = Board::GetInstance().GetAudioCodec();
-            if (codec) codec->SetOutputVolume(v);
+            if (codec)
+                codec->SetOutputVolume(v);
         });
     };
     args.arg = boxed;  // esp_timer 不自动传参，漏设即 nullptr 崩溃
@@ -172,9 +175,8 @@ static void RestoreVolumeLater(int volume, int delay_ms) {
 // 4) 全部播完后恢复原音量
 // emotion 须用固件支持的表情名（"warning" 无对应图标，映射为 angry）
 // ------------------------------------------------------------------
-static void ShowElderAlert(const char* title, const char* message,
-                           const char* emotion, int extra_beeps = 2,
-                           int interval_ms = 2000) {
+static void ShowElderAlert(const char* title, const char* message, const char* emotion,
+                           int extra_beeps = 2, int interval_ms = 2000) {
     auto& app = Application::GetInstance();
     auto* codec = Board::GetInstance().GetAudioCodec();
     int previous_volume = 0;
@@ -182,13 +184,12 @@ static void ShowElderAlert(const char* title, const char* message,
         previous_volume = codec->output_volume();
         codec->SetOutputVolume(100);
     }
-    std::string emo = (emotion != nullptr && std::string_view(emotion) == "warning")
-                          ? "angry" : "neutral";
+    std::string emo =
+        (emotion != nullptr && std::string_view(emotion) == "warning") ? "angry" : "neutral";
     app.Alert(title, message, emo.c_str(), Lang::Sounds::OGG_EXCLAMATION);
 
-    auto* state = new ElderAlertState{title, message, emo,
-                                      &Lang::Sounds::OGG_EXCLAMATION,
-                                      extra_beeps, 4, interval_ms};
+    auto* state = new ElderAlertState{
+        title, message, emo, &Lang::Sounds::OGG_EXCLAMATION, extra_beeps, 4, interval_ms};
     ElderAlertScheduleNext(state, interval_ms);  // 首次补声在 +interval
 
     if (previous_volume > 0) {
@@ -260,7 +261,6 @@ static int PurgeExpiredVoiceMessages(cJSON* root) {
 
 class CompactWifiBoardS3Cam : public WifiBoard {
 private:
-
     Button boot_button_;
     Button sos_button_;
     LcdDisplay* display_;
@@ -273,10 +273,11 @@ private:
     struct CameraLockGuard {
         Camera* cam;
         bool held;
-        explicit CameraLockGuard(Camera* c) : cam(c) {
-            held = c ? c->TryLock() : false;
+        explicit CameraLockGuard(Camera* c) : cam(c) { held = c ? c->TryLock() : false; }
+        ~CameraLockGuard() {
+            if (held)
+                cam->Unlock();
         }
-        ~CameraLockGuard() { if (held) cam->Unlock(); }
         bool Held() const { return held; }
     };
 
@@ -319,22 +320,23 @@ private:
         gc9a01_vendor_config_t gc9107_vendor_config = {
             .init_cmds = gc9107_lcd_init_cmds,
             .init_cmds_size = sizeof(gc9107_lcd_init_cmds) / sizeof(gc9a01_lcd_init_cmd_t),
-        };        
+        };
 #else
         ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(panel_io, &panel_config, &panel));
 #endif
-        
+
         esp_lcd_panel_reset(panel);
 
         esp_lcd_panel_init(panel);
         esp_lcd_panel_invert_color(panel, DISPLAY_INVERT_COLOR);
         esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
-#ifdef  LCD_TYPE_GC9A01_SERIAL
+#ifdef LCD_TYPE_GC9A01_SERIAL
         panel_config.vendor_config = &gc9107_vendor_config;
 #endif
-        display_ = new SpiLcdDisplay(panel_io, panel,
-                                    DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        display_ = new SpiLcdDisplay(panel_io, panel, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                     DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X,
+                                     DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
     void InitializeCamera() {
@@ -379,7 +381,7 @@ private:
 
     // SOS 紧急按键：长按触发紧急告警
     void InitializeSosButton() {
-        sos_button_.OnLongPress([this]() {
+        sos_button_.OnLongPress([]() {
             ESP_LOGW(TAG, "SOS button long pressed!");
             // 读取紧急联系人，拼到告警消息里
             std::string contacts_info;
@@ -389,13 +391,15 @@ private:
             if (root != nullptr && cJSON_IsArray(root)) {
                 cJSON* elem = nullptr;
                 int idx = 0;
-                cJSON_ArrayForEach(elem, root) {
-                    if (idx >= 2) break;  // 最多显示前两个
+                cJSON_ArrayForEach (elem, root) {
+                    if (idx >= 2)
+                        break;  // 最多显示前两个
                     cJSON* name = cJSON_GetObjectItem(elem, "name");
                     cJSON* rel = cJSON_GetObjectItem(elem, "relation");
                     cJSON* phone = cJSON_GetObjectItem(elem, "phone");
                     contacts_info += "联系";
-                    if (rel && cJSON_IsString(rel)) contacts_info += rel->valuestring;
+                    if (rel && cJSON_IsString(rel))
+                        contacts_info += rel->valuestring;
                     if (name && cJSON_IsString(name)) {
                         contacts_info += " ";
                         contacts_info += name->valuestring;
@@ -408,15 +412,20 @@ private:
                     idx++;
                 }
             }
-            if (root) cJSON_Delete(root);
+            if (root)
+                cJSON_Delete(root);
 
-            std::string message = "紧急求助！老人按下了 SOS 键。\n" + contacts_info;
+            // 关怀同步拉取到的老人姓名（无则用"老人"）
+            Settings care_settings("care", false);
+            std::string elder_name = care_settings.GetString("elder_name");
+            std::string who = elder_name.empty() ? "老人" : elder_name;
+
+            std::string message = "紧急求助！" + who + "按下了 SOS 键。\n" + contacts_info;
             // UI/音频/MCP 消息必须回主任务
             Application::GetInstance().Schedule([message]() {
                 auto& app = Application::GetInstance();
                 ShowElderAlert("紧急求助", message.c_str(), "warning");
-                app.SendMcpMessage(
-                    "{\"type\":\"sos_alert\",\"source\":\"device\"}");
+                app.SendMcpMessage("{\"type\":\"sos_alert\",\"source\":\"device\"}");
             });
         });
     }
@@ -453,7 +462,8 @@ private:
 
                 cJSON* root = cJSON_Parse(stored.c_str());
                 if (root == nullptr || !cJSON_IsArray(root)) {
-                    if (root) cJSON_Delete(root);
+                    if (root)
+                        cJSON_Delete(root);
                     root = cJSON_CreateArray();
                 }
 
@@ -462,10 +472,47 @@ private:
                         cJSON_Delete(root);
                         return std::unexpected("medicine and time are required for 'add'");
                     }
+                    // 重复计划直接返回现有列表（含重复时间+药名的计划）
+                    cJSON* exist = nullptr;
+                    cJSON_ArrayForEach (exist, root) {
+                        cJSON* t = cJSON_GetObjectItem(exist, "time");
+                        cJSON* m = cJSON_GetObjectItem(exist, "medicine");
+                        if (cJSON_IsString(t) && cJSON_IsString(m) &&
+                            strcmp(t->valuestring, time.c_str()) == 0 &&
+                            strcmp(m->valuestring, medicine.c_str()) == 0) {
+                            return root;
+                        }
+                    }
                     cJSON* item = cJSON_CreateObject();
                     cJSON_AddStringToObject(item, "time", time.c_str());
                     cJSON_AddStringToObject(item, "medicine", medicine.c_str());
                     cJSON_AddItemToArray(root, item);
+                // 云端同步放到后台任务，避免阻塞 MCP 响应导致 30s 超时。
+                // planId 由 care_sync 周期任务兜底回填（每 5 分钟自愈）。
+#ifdef CONFIG_ENABLE_CARE_SYNC
+                    auto* med = new std::string(medicine);
+                    auto* t = new std::string(time);
+                    xTaskCreate(
+                        [](void* arg) {
+                            auto* pair = static_cast<std::pair<std::string*, std::string*>*>(arg);
+                            std::string plan_id;
+                            if (CarePushPlan(pair->first->c_str(), pair->second->c_str(),
+                                             &plan_id)) {
+                                ESP_LOGI(TAG, "medication_reminder: cloud synced (%s %s -> %s)",
+                                         pair->second->c_str(), pair->first->c_str(),
+                                         plan_id.c_str());
+                            } else {
+                                ESP_LOGW(TAG, "medication_reminder: cloud sync failed (%s %s)",
+                                         pair->second->c_str(), pair->first->c_str());
+                            }
+                            delete pair->first;
+                            delete pair->second;
+                            delete pair;
+                            vTaskDelete(NULL);
+                        },
+                        "care_plan_add", 4096, new std::pair<std::string*, std::string*>(med, t), 1,
+                        nullptr);
+#endif
                 } else if (action == "remove") {
                     if (time.empty()) {
                         cJSON_Delete(root);
@@ -473,16 +520,54 @@ private:
                     }
                     // 原地删除匹配项；不能用 AddItemReferenceToArray+Delete(root)，
                     // 引用会悬垂导致 PrintUnformatted 访问已释放内存
+                    std::vector<std::string> removed_plan_ids;
                     cJSON* elem = root->child;
                     while (elem != nullptr) {
                         cJSON* next = elem->next;
                         cJSON* t = cJSON_GetObjectItem(elem, "time");
                         if (t != nullptr && cJSON_IsString(t) &&
                             strcmp(t->valuestring, time.c_str()) == 0) {
+#ifdef CONFIG_ENABLE_CARE_SYNC
+                            cJSON* pid = cJSON_GetObjectItem(elem, "planId");
+                            if (pid != nullptr && cJSON_IsString(pid)) {
+                                removed_plan_ids.emplace_back(pid->valuestring);
+                            }
+#endif
                             UnlinkAndDeleteItem(root, elem);
                         }
                         elem = next;
                     }
+#ifdef CONFIG_ENABLE_CARE_SYNC
+                    // 云端同步删除放到后台任务执行，避免阻塞 MCP 响应导致 30s 超时。
+                    // 先把 planId 记入 tombstone（NVS 持久化）：若后台删除失败
+                    // （如会话结束时 Wi-Fi 省电/断连），care_sync 周期任务会重试，
+                    // 防止"本地已删、云端仍在"被下一拍 sync 按"云端为准"复活。
+                    for (const auto& pid : removed_plan_ids) {
+                        AddPendingDelete(pid);
+                    }
+                    if (!removed_plan_ids.empty()) {
+                        auto* ids = new std::vector<std::string>(std::move(removed_plan_ids));
+                        xTaskCreate(
+                            [](void* arg) {
+                                auto* plan_ids = static_cast<std::vector<std::string>*>(arg);
+                                for (const auto& pid : *plan_ids) {
+                                    if (CareDeletePlan(pid)) {
+                                        RemovePendingDelete(pid);
+                                        ESP_LOGI(TAG,
+                                                 "medication_reminder: cloud plan deleted (%s)",
+                                                 pid.c_str());
+                                    } else {
+                                        ESP_LOGW(TAG,
+                                                 "medication_reminder: cloud delete failed (%s)",
+                                                 pid.c_str());
+                                    }
+                                }
+                                delete plan_ids;
+                                vTaskDelete(NULL);
+                            },
+                            "care_plan_del", 4096, ids, 1, nullptr);
+                    }
+#endif
                 } else if (action != "list") {
                     cJSON_Delete(root);
                     return std::unexpected("Unknown action: " + action);
@@ -506,8 +591,7 @@ private:
             "拍照并调用云端视觉模型判断画面中是否有人呈跌倒姿态。\n"
             "用于实时检测，不回答跌倒预防/急救知识问题（此类问题请直接回答）。\n"
             "返回 JSON {fell, confidence, description}。",
-            PropertyList(),
-            [this](const PropertyList& properties) -> ToolResult {
+            PropertyList(), [](const PropertyList& properties) -> ToolResult {
                 auto camera = Board::GetInstance().GetCamera();
                 if (camera == nullptr) {
                     return std::unexpected("Camera not available on this board");
@@ -537,89 +621,89 @@ private:
             });
 
         // 工具 3：家属留言板（文字版）
-        mcp.AddTool(
-            "self.family_voice_board",
-            "家属留言板。家属可远程为老人添加文字留言，老人按键时设备会朗读。\n"
-            "留言默认保留 3 天（menuconfig VOICE_BOARD_MSG_TTL_DAYS 可调 1-30 天），\n"
-            "到期自动删除。\n"
-            "Args:\n"
-            "  action: 'add' | 'list' | 'play_latest'\n"
-            "  sender: 留言人姓名（add 时必填）\n"
-            "  message: 留言内容（add 时必填）\n"
-            "Return:\n"
-            "  list 返回 [{sender, message, time}, ...]；\n"
-            "  play_latest 返回最新留言文本，调用方应通过 TTS 播报。",
-            PropertyList({
-                Property("action", kPropertyTypeString),
-                Property("sender", kPropertyTypeString, std::string("")),
-                Property("message", kPropertyTypeString, std::string("")),
-            }),
-            [](const PropertyList& properties) -> ToolResult {
-                auto action = properties["action"].value<std::string>();
-                auto sender = properties["sender"].value<std::string>();
-                auto message = properties["message"].value<std::string>();
+        mcp.AddTool("self.family_voice_board",
+                    "家属留言板。家属可远程为老人添加文字留言，老人按键时设备会朗读。\n"
+                    "留言默认保留 3 天（menuconfig VOICE_BOARD_MSG_TTL_DAYS 可调 1-30 天），\n"
+                    "到期自动删除。\n"
+                    "Args:\n"
+                    "  action: 'add' | 'list' | 'play_latest'\n"
+                    "  sender: 留言人姓名（add 时必填）\n"
+                    "  message: 留言内容（add 时必填）\n"
+                    "Return:\n"
+                    "  list 返回 [{sender, message, time}, ...]；\n"
+                    "  play_latest 返回最新留言文本，调用方应通过 TTS 播报。",
+                    PropertyList({
+                        Property("action", kPropertyTypeString),
+                        Property("sender", kPropertyTypeString, std::string("")),
+                        Property("message", kPropertyTypeString, std::string("")),
+                    }),
+                    [](const PropertyList& properties) -> ToolResult {
+                        auto action = properties["action"].value<std::string>();
+                        auto sender = properties["sender"].value<std::string>();
+                        auto message = properties["message"].value<std::string>();
 
-                Settings settings("voice_board", true);
-                std::string stored = settings.GetString("messages", "[]");
+                        Settings settings("voice_board", true);
+                        std::string stored = settings.GetString("messages", "[]");
 
-                cJSON* root = cJSON_Parse(stored.c_str());
-                if (root == nullptr || !cJSON_IsArray(root)) {
-                    if (root) cJSON_Delete(root);
-                    root = cJSON_CreateArray();
-                }
+                        cJSON* root = cJSON_Parse(stored.c_str());
+                        if (root == nullptr || !cJSON_IsArray(root)) {
+                            if (root)
+                                cJSON_Delete(root);
+                            root = cJSON_CreateArray();
+                        }
 
-                // 过期留言自动清理：有删除则立即写回 NVS
-                if (PurgeExpiredVoiceMessages(root) > 0) {
-                    StoreJson(settings, "family_voice_board", "messages", root);
-                }
+                        // 过期留言自动清理：有删除则立即写回 NVS
+                        if (PurgeExpiredVoiceMessages(root) > 0) {
+                            StoreJson(settings, "family_voice_board", "messages", root);
+                        }
 
-                if (action == "add") {
-                    if (sender.empty() || message.empty()) {
+                        if (action == "add") {
+                            if (sender.empty() || message.empty()) {
+                                cJSON_Delete(root);
+                                return std::unexpected("sender and message are required for 'add'");
+                            }
+                            time_t now = time(nullptr);
+                            char time_buf[32] = {0};
+                            if (now > 1700000000) {
+                                strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M",
+                                         localtime(&now));
+                            } else {
+                                snprintf(time_buf, sizeof(time_buf), "tick");
+                            }
+                            cJSON* item = cJSON_CreateObject();
+                            cJSON_AddStringToObject(item, "sender", sender.c_str());
+                            cJSON_AddStringToObject(item, "message", message.c_str());
+                            cJSON_AddStringToObject(item, "time", time_buf);
+                            cJSON_AddNumberToObject(item, "epoch", (double)now);
+                            cJSON_AddItemToArray(root, item);
+                            StoreJson(settings, "family_voice_board", "messages", root);
+                            return root;
+                        }
+
+                        if (action == "list") {
+                            return root;
+                        }
+
+                        if (action == "play_latest") {
+                            int count = cJSON_GetArraySize(root);
+                            if (count == 0) {
+                                cJSON_Delete(root);
+                                return std::unexpected("No messages yet");
+                            }
+                            cJSON* last = cJSON_GetArrayItem(root, count - 1);
+                            cJSON* msg = cJSON_GetObjectItem(last, "message");
+                            cJSON* sdr = cJSON_GetObjectItem(last, "sender");
+                            std::string text = "来自 ";
+                            text += (sdr && cJSON_IsString(sdr)) ? sdr->valuestring : "家人";
+                            text += " 的留言：";
+                            text += (msg && cJSON_IsString(msg)) ? msg->valuestring : "";
+                            cJSON_Delete(root);
+                            return text;
+                        }
+
                         cJSON_Delete(root);
-                        return std::unexpected("sender and message are required for 'add'");
-                    }
-                    time_t now = time(nullptr);
-                    char time_buf[32] = {0};
-                    if (now > 1700000000) {
-                        strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M",
-                                 localtime(&now));
-                    } else {
-                        snprintf(time_buf, sizeof(time_buf), "tick");
-                    }
-                    cJSON* item = cJSON_CreateObject();
-                    cJSON_AddStringToObject(item, "sender", sender.c_str());
-                    cJSON_AddStringToObject(item, "message", message.c_str());
-                    cJSON_AddStringToObject(item, "time", time_buf);
-                    cJSON_AddNumberToObject(item, "epoch", (double)now);
-                    cJSON_AddItemToArray(root, item);
-                    StoreJson(settings, "family_voice_board", "messages", root);
-                    return root;
-                }
-
-                if (action == "list") {
-                    return root;
-                }
-
-                if (action == "play_latest") {
-                    int count = cJSON_GetArraySize(root);
-                    if (count == 0) {
-                        cJSON_Delete(root);
-                        return std::unexpected("No messages yet");
-                    }
-                    cJSON* last = cJSON_GetArrayItem(root, count - 1);
-                    cJSON* msg = cJSON_GetObjectItem(last, "message");
-                    cJSON* sdr = cJSON_GetObjectItem(last, "sender");
-                    std::string text = "来自 ";
-                    text += (sdr && cJSON_IsString(sdr)) ? sdr->valuestring : "家人";
-                    text += " 的留言：";
-                    text += (msg && cJSON_IsString(msg)) ? msg->valuestring : "";
-                    cJSON_Delete(root);
-                    return text;
-                }
-
-                cJSON_Delete(root);
-                return std::unexpected("Unknown action: " + action);
-            });
+                        return std::unexpected("Unknown action: " + action);
+                    });
 
         // ===== 银发经济扩展工具 =====
 
@@ -655,7 +739,8 @@ private:
                 std::string stored = settings.GetString("logs", "{}");
                 cJSON* root = cJSON_Parse(stored.c_str());
                 if (root == nullptr || !cJSON_IsObject(root)) {
-                    if (root) cJSON_Delete(root);
+                    if (root)
+                        cJSON_Delete(root);
                     root = cJSON_CreateObject();
                 }
 
@@ -697,7 +782,7 @@ private:
                     }
                     // 避免重复打卡；已打过卡则保留原记录（含原打卡时间）
                     cJSON* elem = nullptr;
-                    cJSON_ArrayForEach(elem, day_arr) {
+                    cJSON_ArrayForEach (elem, day_arr) {
                         const char* name = elem_medicine(elem);
                         if (name != nullptr && strcmp(name, medicine.c_str()) == 0) {
                             StoreJson(settings, "medication_log", "logs", root);
@@ -715,6 +800,12 @@ private:
                         RecordMedicationCheckin(medicine, now);
                     }
 #endif
+#ifdef CONFIG_ENABLE_CARE_SYNC
+                    // 上报后台 medication_record（msgId 幂等：每天每药一条）
+                    if (time_valid) {
+                        CareReportTaken(medicine, now);
+                    }
+#endif
                     return root;
                 }
 
@@ -728,7 +819,7 @@ private:
                     std::string taken_time;
                     if (day_arr != nullptr && cJSON_IsArray(day_arr)) {
                         cJSON* elem = nullptr;
-                        cJSON_ArrayForEach(elem, day_arr) {
+                        cJSON_ArrayForEach (elem, day_arr) {
                             const char* name = elem_medicine(elem);
                             if (name != nullptr && strcmp(name, medicine.c_str()) == 0) {
                                 taken = true;
@@ -745,8 +836,7 @@ private:
                     cJSON_Delete(root);
                     cJSON* result = cJSON_CreateObject();
                     cJSON_AddBoolToObject(result, "taken", taken);
-                    cJSON_AddStringToObject(result, "time",
-                                           taken ? taken_time.c_str() : "");
+                    cJSON_AddStringToObject(result, "time", taken ? taken_time.c_str() : "");
                     return result;
                 }
 
@@ -775,8 +865,7 @@ private:
                 if (action == "report" || action == "history") {
                     cJSON_Delete(root);
                     (void)days;
-                    return std::unexpected(
-                        "Medication reminder task is not enabled in firmware");
+                    return std::unexpected("Medication reminder task is not enabled in firmware");
                 }
 #endif
 
@@ -786,7 +875,8 @@ private:
 
         // 工具 5：通用日程提醒
 #if !defined(CONFIG_ENABLE_SCHEDULE_REMINDER)
-#pragma message("self.schedule_reminder: ENABLE_SCHEDULE_REMINDER is OFF, reminders will be stored but NEVER fire")
+#pragma message( \
+    "self.schedule_reminder: ENABLE_SCHEDULE_REMINDER is OFF, reminders will be stored but NEVER fire")
 #endif
         mcp.AddTool(
             "self.schedule_reminder",
@@ -816,7 +906,8 @@ private:
                 std::string stored = settings.GetString("reminders", "[]");
                 cJSON* root = cJSON_Parse(stored.c_str());
                 if (root == nullptr || !cJSON_IsArray(root)) {
-                    if (root) cJSON_Delete(root);
+                    if (root)
+                        cJSON_Delete(root);
                     root = cJSON_CreateArray();
                 }
 
@@ -831,7 +922,8 @@ private:
                     return std::unexpected(
                         "日程播报后台任务未启用（menuconfig 中 ENABLE_SCHEDULE_REMINDER 未开启），"
                         "提醒到点不会弹屏或响铃。请先在 SDK Configuration Editor 勾选 "
-                        "Enable Scheduled Reminder Announcement 并重新编译烧录固件，再设置日程提醒。");
+                        "Enable Scheduled Reminder Announcement "
+                        "并重新编译烧录固件，再设置日程提醒。");
 #endif
                     cJSON* item = cJSON_CreateObject();
                     cJSON_AddStringToObject(item, "time", time.c_str());
@@ -871,78 +963,78 @@ private:
             });
 
         // 工具 6：紧急联系人管理
-        mcp.AddTool(
-            "self.emergency_contact",
-            "管理老人的紧急联系人（家属、医生等）。\n"
-            "Args:\n"
-            "  action: 'add' | 'remove' | 'list'\n"
-            "  name: 联系人姓名（add 必填）\n"
-            "  relation: 关系，如'儿子''医生'（add 必填）\n"
-            "  phone: 电话号码（add 必填）\n"
-            "Return:\n"
-            "  list 返回 [{name, relation, phone}, ...]。",
-            PropertyList({
-                Property("action", kPropertyTypeString),
-                Property("name", kPropertyTypeString, std::string("")),
-                Property("relation", kPropertyTypeString, std::string("")),
-                Property("phone", kPropertyTypeString, std::string("")),
-            }),
-            [](const PropertyList& properties) -> ToolResult {
-                auto action = properties["action"].value<std::string>();
-                auto name = properties["name"].value<std::string>();
-                auto relation = properties["relation"].value<std::string>();
-                auto phone = properties["phone"].value<std::string>();
+        mcp.AddTool("self.emergency_contact",
+                    "管理老人的紧急联系人（家属、医生等）。\n"
+                    "Args:\n"
+                    "  action: 'add' | 'remove' | 'list'\n"
+                    "  name: 联系人姓名（add 必填）\n"
+                    "  relation: 关系，如'儿子''医生'（add 必填）\n"
+                    "  phone: 电话号码（add 必填）\n"
+                    "Return:\n"
+                    "  list 返回 [{name, relation, phone}, ...]。",
+                    PropertyList({
+                        Property("action", kPropertyTypeString),
+                        Property("name", kPropertyTypeString, std::string("")),
+                        Property("relation", kPropertyTypeString, std::string("")),
+                        Property("phone", kPropertyTypeString, std::string("")),
+                    }),
+                    [](const PropertyList& properties) -> ToolResult {
+                        auto action = properties["action"].value<std::string>();
+                        auto name = properties["name"].value<std::string>();
+                        auto relation = properties["relation"].value<std::string>();
+                        auto phone = properties["phone"].value<std::string>();
 
-                Settings settings("contacts", true);
-                std::string stored = settings.GetString("list", "[]");
-                cJSON* root = cJSON_Parse(stored.c_str());
-                if (root == nullptr || !cJSON_IsArray(root)) {
-                    if (root) cJSON_Delete(root);
-                    root = cJSON_CreateArray();
-                }
-
-                if (action == "add") {
-                    if (name.empty() || phone.empty()) {
-                        cJSON_Delete(root);
-                        return std::unexpected("name and phone are required for 'add'");
-                    }
-                    cJSON* item = cJSON_CreateObject();
-                    cJSON_AddStringToObject(item, "name", name.c_str());
-                    cJSON_AddStringToObject(item, "relation", relation.c_str());
-                    cJSON_AddStringToObject(item, "phone", phone.c_str());
-                    cJSON_AddItemToArray(root, item);
-                    StoreJson(settings, "emergency_contact", "list", root);
-                    return root;
-                }
-
-                if (action == "remove") {
-                    if (name.empty()) {
-                        cJSON_Delete(root);
-                        return std::unexpected("name is required for 'remove'");
-                    }
-                    // 原地删除匹配项；不能用 AddItemReferenceToArray+Delete(root)，
-                    // 引用会悬垂导致 PrintUnformatted 访问已释放内存
-                    cJSON* elem = root->child;
-                    while (elem != nullptr) {
-                        cJSON* next = elem->next;
-                        cJSON* n = cJSON_GetObjectItem(elem, "name");
-                        if (n != nullptr && cJSON_IsString(n) &&
-                            strcmp(n->valuestring, name.c_str()) == 0) {
-                            UnlinkAndDeleteItem(root, elem);
+                        Settings settings("contacts", true);
+                        std::string stored = settings.GetString("list", "[]");
+                        cJSON* root = cJSON_Parse(stored.c_str());
+                        if (root == nullptr || !cJSON_IsArray(root)) {
+                            if (root)
+                                cJSON_Delete(root);
+                            root = cJSON_CreateArray();
                         }
-                        elem = next;
-                    }
-                    StoreJson(settings, "emergency_contact", "list", root);
-                    return root;
-                }
 
-                if (action == "list") {
-                    return root;
-                }
+                        if (action == "add") {
+                            if (name.empty() || phone.empty()) {
+                                cJSON_Delete(root);
+                                return std::unexpected("name and phone are required for 'add'");
+                            }
+                            cJSON* item = cJSON_CreateObject();
+                            cJSON_AddStringToObject(item, "name", name.c_str());
+                            cJSON_AddStringToObject(item, "relation", relation.c_str());
+                            cJSON_AddStringToObject(item, "phone", phone.c_str());
+                            cJSON_AddItemToArray(root, item);
+                            StoreJson(settings, "emergency_contact", "list", root);
+                            return root;
+                        }
 
-                cJSON_Delete(root);
-                return std::unexpected("Unknown action: " + action);
-            });
+                        if (action == "remove") {
+                            if (name.empty()) {
+                                cJSON_Delete(root);
+                                return std::unexpected("name is required for 'remove'");
+                            }
+                            // 原地删除匹配项；不能用 AddItemReferenceToArray+Delete(root)，
+                            // 引用会悬垂导致 PrintUnformatted 访问已释放内存
+                            cJSON* elem = root->child;
+                            while (elem != nullptr) {
+                                cJSON* next = elem->next;
+                                cJSON* n = cJSON_GetObjectItem(elem, "name");
+                                if (n != nullptr && cJSON_IsString(n) &&
+                                    strcmp(n->valuestring, name.c_str()) == 0) {
+                                    UnlinkAndDeleteItem(root, elem);
+                                }
+                                elem = next;
+                            }
+                            StoreJson(settings, "emergency_contact", "list", root);
+                            return root;
+                        }
+
+                        if (action == "list") {
+                            return root;
+                        }
+
+                        cJSON_Delete(root);
+                        return std::unexpected("Unknown action: " + action);
+                    });
 
         // 工具 7：找东西（复用摄像头+云端视觉）
         mcp.AddTool(
@@ -955,7 +1047,7 @@ private:
             PropertyList({
                 Property("item", kPropertyTypeString),
             }),
-            [this](const PropertyList& properties) -> ToolResult {
+            [](const PropertyList& properties) -> ToolResult {
                 auto item = properties["item"].value<std::string>();
                 if (item.empty()) {
                     return std::unexpected("item is required");
@@ -974,11 +1066,10 @@ private:
                 if (!camera->Capture()) {
                     return std::unexpected("Failed to capture photo, please try again");
                 }
-                std::string prompt =
-                    "请仔细观察画面，帮忙寻找「" + item +
-                    "」。如果找到了，请描述它在画面中的位置"
-                    "（如'在左边的桌子上'）；如果没找到，请说'没看到'。"
-                    "请用简短的中文回答。";
+                std::string prompt = "请仔细观察画面，帮忙寻找「" + item +
+                                     "」。如果找到了，请描述它在画面中的位置"
+                                     "（如'在左边的桌子上'）；如果没找到，请说'没看到'。"
+                                     "请用简短的中文回答。";
                 auto result = camera->Explain(prompt);
                 if (!result) {
                     // 拍照已成功且照片已在屏幕显示；上传失败（含 429 限流）告知而非报错
@@ -990,8 +1081,8 @@ private:
                 cJSON* envelope = cJSON_Parse(result->c_str());
                 if (envelope != nullptr) {
                     cJSON* text_item = cJSON_GetObjectItem(envelope, "text");
-                    model_text = (text_item && cJSON_IsString(text_item))
-                                     ? text_item->valuestring : *result;
+                    model_text =
+                        (text_item && cJSON_IsString(text_item)) ? text_item->valuestring : *result;
                     cJSON_Delete(envelope);
                 } else {
                     model_text = *result;
@@ -1005,8 +1096,7 @@ private:
             "拍照识别门口的人，防诈骗。\n"
             "无参数。返回对画面中人物的描述（人数、穿着、是否认识等），"
             "由 AI 转语音告诉老人。",
-            PropertyList(),
-            [this](const PropertyList& properties) -> ToolResult {
+            PropertyList(), [](const PropertyList& properties) -> ToolResult {
                 auto camera = Board::GetInstance().GetCamera();
                 if (camera == nullptr) {
                     return std::unexpected("Camera not available on this board");
@@ -1035,8 +1125,8 @@ private:
                 cJSON* envelope = cJSON_Parse(result->c_str());
                 if (envelope != nullptr) {
                     cJSON* text_item = cJSON_GetObjectItem(envelope, "text");
-                    model_text = (text_item && cJSON_IsString(text_item))
-                                     ? text_item->valuestring : *result;
+                    model_text =
+                        (text_item && cJSON_IsString(text_item)) ? text_item->valuestring : *result;
                     cJSON_Delete(envelope);
                 } else {
                     model_text = *result;
@@ -1045,53 +1135,52 @@ private:
             });
 
         // 工具 9：天气查询
-        mcp.AddTool(
-            "self.weather_query",
-            "查询当前实时天气数据（温度、天气状况）。\n"
-            "仅返回天气数据，不回答穿衣建议或健康指导（此类问题请直接回答）。\n"
-            "Args:\n"
-            "  city: 城市名（可选，默认自动定位）\n"
-            "Return:\n"
-            "  天气描述文本，由 AI 转语音告诉老人。",
-            PropertyList({
-                Property("city", kPropertyTypeString, std::string("")),
-            }),
-            [](const PropertyList& properties) -> ToolResult {
-                auto city = properties["city"].value<std::string>();
-                auto network = Board::GetInstance().GetNetwork();
-                if (network == nullptr) {
-                    return std::unexpected("Network not available");
-                }
-                // wttr.in 支持纯文本格式：format=3 返回 "城市: 天气 温度"
-                std::string url = "https://wttr.in/";
-                if (!city.empty()) {
-                    url += city;
-                }
-                url += "?format=3&lang=zh";
+        mcp.AddTool("self.weather_query",
+                    "查询当前实时天气数据（温度、天气状况）。\n"
+                    "仅返回天气数据，不回答穿衣建议或健康指导（此类问题请直接回答）。\n"
+                    "Args:\n"
+                    "  city: 城市名（可选，默认自动定位）\n"
+                    "Return:\n"
+                    "  天气描述文本，由 AI 转语音告诉老人。",
+                    PropertyList({
+                        Property("city", kPropertyTypeString, std::string("")),
+                    }),
+                    [](const PropertyList& properties) -> ToolResult {
+                        auto city = properties["city"].value<std::string>();
+                        auto network = Board::GetInstance().GetNetwork();
+                        if (network == nullptr) {
+                            return std::unexpected("Network not available");
+                        }
+                        // wttr.in 支持纯文本格式：format=3 返回 "城市: 天气 温度"
+                        std::string url = "https://wttr.in/";
+                        if (!city.empty()) {
+                            url += city;
+                        }
+                        url += "?format=3&lang=zh";
 
-                auto http = network->CreateHttp(10);
-                if (http == nullptr) {
-                    return std::unexpected("Failed to create HTTP client");
-                }
-                auto opened = http->Open("GET", url);
-                if (!opened) {
-                    std::string err = opened.error().ToString().c_str();
-                    http->Close();
-                    return std::unexpected("Failed to open HTTP connection: " + err);
-                }
-                auto status = http->GetStatusCode();
-                if (!status || *status != 200) {
-                    http->Close();
-                    return std::unexpected("Weather API returned status: " +
-                                            std::to_string(status ? *status : -1));
-                }
-                std::string body = http->ReadAll();
-                http->Close();
-                if (body.empty()) {
-                    return std::unexpected("Empty response from weather API");
-                }
-                return body;
-            });
+                        auto http = network->CreateHttp(10);
+                        if (http == nullptr) {
+                            return std::unexpected("Failed to create HTTP client");
+                        }
+                        auto opened = http->Open("GET", url);
+                        if (!opened) {
+                            std::string err = opened.error().ToString().c_str();
+                            http->Close();
+                            return std::unexpected("Failed to open HTTP connection: " + err);
+                        }
+                        auto status = http->GetStatusCode();
+                        if (!status || *status != 200) {
+                            http->Close();
+                            return std::unexpected("Weather API returned status: " +
+                                                   std::to_string(status ? *status : -1));
+                        }
+                        std::string body = http->ReadAll();
+                        http->Close();
+                        if (body.empty()) {
+                            return std::unexpected("Empty response from weather API");
+                        }
+                        return body;
+                    });
     }
 
 #ifdef CONFIG_ENABLE_BOARD_FALL_DETECTION
@@ -1225,12 +1314,11 @@ private:
         Application::GetInstance().Schedule([description]() {
             auto& app = Application::GetInstance();
             // 把模型的描述一起带上，屏幕和家属端能看到具体发生了什么
-            ShowElderAlert("跌倒警报",
-                           description.empty() ? "检测到老人可能跌倒，请立即确认"
-                                               : description.c_str(),
-                           "warning");
-            app.SendMcpMessage(
-                "{\"type\":\"fall_alert\",\"source\":\"device\"}");
+            ShowElderAlert(
+                "跌倒警报",
+                description.empty() ? "检测到老人可能跌倒，请立即确认" : description.c_str(),
+                "warning");
+            app.SendMcpMessage("{\"type\":\"fall_alert\",\"source\":\"device\"}");
         });
     }
 
@@ -1242,15 +1330,13 @@ private:
         args.name = "fall_det";
         esp_err_t err = esp_timer_create(&args, &fall_detection_timer_);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "fall_detection: create timer failed: %s",
-                     esp_err_to_name(err));
+            ESP_LOGE(TAG, "fall_detection: create timer failed: %s", esp_err_to_name(err));
             return;
         }
         err = esp_timer_start_periodic(fall_detection_timer_,
-            CONFIG_BOARD_FALL_DETECTION_PERIOD_MS * 1000);
+                                       CONFIG_BOARD_FALL_DETECTION_PERIOD_MS * 1000);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "fall_detection: start timer failed: %s",
-                     esp_err_to_name(err));
+            ESP_LOGE(TAG, "fall_detection: start timer failed: %s", esp_err_to_name(err));
             return;
         }
         ESP_LOGI(TAG, "fall_detection: timer started, period=%d ms",
@@ -1288,22 +1374,20 @@ private:
         std::string stored = settings.GetString("reminders", "[]");
         cJSON* root = cJSON_Parse(stored.c_str());
         if (root == nullptr || !cJSON_IsArray(root)) {
-            if (root) cJSON_Delete(root);
+            if (root)
+                cJSON_Delete(root);
             return;
         }
         cJSON* elem = nullptr;
-        cJSON_ArrayForEach(elem, root) {
+        cJSON_ArrayForEach (elem, root) {
             cJSON* t = cJSON_GetObjectItem(elem, "time");
             cJSON* c = cJSON_GetObjectItem(elem, "content");
-            if (t != nullptr && cJSON_IsString(t) &&
-                strcmp(t->valuestring, cur.c_str()) == 0) {
+            if (t != nullptr && cJSON_IsString(t) && strcmp(t->valuestring, cur.c_str()) == 0) {
                 std::string content =
                     (c != nullptr && cJSON_IsString(c)) ? c->valuestring : "该办事了";
-                ESP_LOGI(TAG, "schedule_reminder: firing '%s' at %s",
-                         content.c_str(), cur.c_str());
-                Application::GetInstance().Schedule([content]() {
-                    ShowElderAlert("日程提醒", content.c_str(), "info");
-                });
+                ESP_LOGI(TAG, "schedule_reminder: firing '%s' at %s", content.c_str(), cur.c_str());
+                Application::GetInstance().Schedule(
+                    [content]() { ShowElderAlert("日程提醒", content.c_str(), "info"); });
             }
         }
         cJSON_Delete(root);
@@ -1317,14 +1401,12 @@ private:
         args.name = "schedule_rem";
         esp_err_t err = esp_timer_create(&args, &schedule_timer_);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "schedule_reminder: create timer failed: %s",
-                     esp_err_to_name(err));
+            ESP_LOGE(TAG, "schedule_reminder: create timer failed: %s", esp_err_to_name(err));
             return;
         }
         err = esp_timer_start_periodic(schedule_timer_, 60 * 1000 * 1000);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "schedule_reminder: start timer failed: %s",
-                     esp_err_to_name(err));
+            ESP_LOGE(TAG, "schedule_reminder: start timer failed: %s", esp_err_to_name(err));
             return;
         }
         ESP_LOGI(TAG, "schedule_reminder: timer started, checking every 60s");
@@ -1389,7 +1471,8 @@ private:
         std::string key = MedicationDoseKey(now);
         cJSON* doses = cJSON_Parse(settings.GetString(key, "[]").c_str());
         if (doses == nullptr || !cJSON_IsArray(doses)) {
-            if (doses) cJSON_Delete(doses);
+            if (doses)
+                cJSON_Delete(doses);
             return;  // 当天没有计划剂量（属于计划外打卡，只写 logs）
         }
 
@@ -1401,12 +1484,11 @@ private:
 
         auto match_dose = [&](const char* want_status) -> cJSON* {
             cJSON* elem = nullptr;
-            cJSON_ArrayForEach(elem, doses) {
+            cJSON_ArrayForEach (elem, doses) {
                 cJSON* med = cJSON_GetObjectItem(elem, "medicine");
                 cJSON* st = cJSON_GetObjectItem(elem, "status");
                 if (med && cJSON_IsString(med) && st && cJSON_IsString(st) &&
-                    medicine == med->valuestring &&
-                    strcmp(st->valuestring, want_status) == 0) {
+                    medicine == med->valuestring && strcmp(st->valuestring, want_status) == 0) {
                     return elem;
                 }
             }
@@ -1426,8 +1508,8 @@ private:
         }
 
         cJSON* planned = cJSON_GetObjectItem(target, "planned");
-        int planned_min = (planned && cJSON_IsString(planned))
-                              ? ParseHHMM(planned->valuestring) : -1;
+        int planned_min =
+            (planned && cJSON_IsString(planned)) ? ParseHHMM(planned->valuestring) : -1;
         // 延迟分钟数（提前吃药记 0）
         int delay = 0;
         if (planned_min >= 0 && now_min > planned_min) {
@@ -1440,8 +1522,8 @@ private:
 
         StoreJson(settings, "medication_checkin", key.c_str(), doses);
         cJSON_Delete(doses);
-        ESP_LOGI(TAG, "medication: checkin %s -> %s, delay=%d min", medicine.c_str(),
-                 new_status, delay);
+        ESP_LOGI(TAG, "medication: checkin %s -> %s, delay=%d min", medicine.c_str(), new_status,
+                 delay);
     }
 
     // 今日服药报告：医嘱剂量状态 + 计划外打卡 + 汇总计数
@@ -1450,7 +1532,8 @@ private:
         std::string key = MedicationDoseKey(now);
         cJSON* doses = cJSON_Parse(settings.GetString(key, "[]").c_str());
         if (doses == nullptr || !cJSON_IsArray(doses)) {
-            if (doses) cJSON_Delete(doses);
+            if (doses)
+                cJSON_Delete(doses);
             doses = cJSON_CreateArray();
         }
 
@@ -1459,7 +1542,7 @@ private:
 
         int n_total = 0, n_taken = 0, n_late = 0, n_missed = 0, n_pending = 0;
         cJSON* elem = nullptr;
-        cJSON_ArrayForEach(elem, doses) {
+        cJSON_ArrayForEach (elem, doses) {
             n_total++;
             cJSON* st = cJSON_GetObjectItem(elem, "status");
             if (st && cJSON_IsString(st)) {
@@ -1488,7 +1571,7 @@ private:
             cJSON* day_logs = cJSON_GetObjectItem(logs, MedicationDate(now).c_str());
             if (day_logs && cJSON_IsArray(day_logs)) {
                 cJSON* log_elem = nullptr;
-                cJSON_ArrayForEach(log_elem, day_logs) {
+                cJSON_ArrayForEach (log_elem, day_logs) {
                     const char* name = nullptr;
                     const char* at = "";
                     if (cJSON_IsString(log_elem)) {
@@ -1503,10 +1586,9 @@ private:
                         continue;
                     }
                     bool in_plan = false;
-                    cJSON_ArrayForEach(elem, doses) {
+                    cJSON_ArrayForEach (elem, doses) {
                         cJSON* dmed = cJSON_GetObjectItem(elem, "medicine");
-                        if (dmed && cJSON_IsString(dmed) &&
-                            strcmp(dmed->valuestring, name) == 0) {
+                        if (dmed && cJSON_IsString(dmed) && strcmp(dmed->valuestring, name) == 0) {
                             in_plan = true;
                             break;
                         }
@@ -1520,7 +1602,8 @@ private:
                 }
             }
         }
-        if (logs) cJSON_Delete(logs);
+        if (logs)
+            cJSON_Delete(logs);
         cJSON_AddItemToObject(report, "unplanned", unplanned);
         return report;
     }
@@ -1543,7 +1626,8 @@ private:
             }
             cJSON* doses = cJSON_Parse(raw.c_str());
             if (doses == nullptr || !cJSON_IsArray(doses)) {
-                if (doses) cJSON_Delete(doses);
+                if (doses)
+                    cJSON_Delete(doses);
                 continue;
             }
             cJSON* day_obj = cJSON_CreateObject();
@@ -1561,8 +1645,10 @@ private:
 
     void FireMedicationDue(const std::string& medicine, const std::string& planned,
                            int remind_times) {
-        std::string message = "该吃" + medicine + "了（计划 " + planned + "）。"
-                              "吃完请对我说：我吃过" + medicine + "了。";
+        std::string message = "该吃" + medicine + "了（计划 " + planned +
+                              "）。"
+                              "吃完请对我说：我吃过" +
+                              medicine + "了。";
         if (remind_times > 1) {
             message = "提醒第 " + std::to_string(remind_times) + " 次：" + message;
         }
@@ -1586,8 +1672,8 @@ private:
     }
 
     void FireMedicationMissed(const std::string& medicine, const std::string& planned) {
-        std::string message = medicine + "（计划 " + planned +
-                              "）超过" + std::to_string(CONFIG_MEDICATION_MISSED_TIMEOUT_MIN) +
+        std::string message = medicine + "（计划 " + planned + "）超过" +
+                              std::to_string(CONFIG_MEDICATION_MISSED_TIMEOUT_MIN) +
                               "分钟未打卡，已记为漏服。";
         Application::GetInstance().Schedule([message, medicine, planned]() {
             ShowElderAlert("漏服提醒", message.c_str(), "warning");
@@ -1640,16 +1726,54 @@ private:
         bool changed = false;
         cJSON* plans = cJSON_Parse(settings.GetString("reminders", "[]").c_str());
         if (plans != nullptr && cJSON_IsArray(plans)) {
+            // 当天是否需要该计划：与云端调度同语义
+            // （daily 恒真；weekdays=周一~五；custom 按 weekdays 逗号列表，1=周一）
+            struct tm today_tm = {};
+            localtime_r(&now, &today_tm);
+            int day_value = (today_tm.tm_wday == 0) ? 7 : today_tm.tm_wday;
+            char day_str[3] = {0};
+            snprintf(day_str, sizeof(day_str), "%d", day_value);
+
             cJSON* plan = nullptr;
-            cJSON_ArrayForEach(plan, plans) {
+            cJSON_ArrayForEach (plan, plans) {
                 cJSON* ptime = cJSON_GetObjectItem(plan, "time");
                 cJSON* pmed = cJSON_GetObjectItem(plan, "medicine");
                 if (!cJSON_IsString(ptime) || !cJSON_IsString(pmed)) {
                     continue;
                 }
+                cJSON* rule = cJSON_GetObjectItem(plan, "rule");
+                const char* rule_str = (rule && cJSON_IsString(rule)) ? rule->valuestring : "daily";
+                if (strcmp(rule_str, "weekdays") == 0) {
+                    if (day_value > 5)
+                        continue;  // 周末不提醒
+                } else if (strcmp(rule_str, "custom") == 0) {
+                    cJSON* wd = cJSON_GetObjectItem(plan, "weekdays");
+                    bool today = false;
+                    if (wd && cJSON_IsString(wd)) {
+                        // 逗号分隔的星期列表，逐段比对（避免 "1" 匹配到 "11" 之类）
+                        std::string list = wd->valuestring;
+                        size_t pos = 0;
+                        while (pos < list.size()) {
+                            size_t comma = list.find(',', pos);
+                            std::string token = (comma == std::string::npos)
+                                                    ? list.substr(pos)
+                                                    : list.substr(pos, comma - pos);
+                            // 去掉首尾空格
+                            size_t b = token.find_first_not_of(" \t");
+                            size_t e = token.find_last_not_of(" \t");
+                            if (b != std::string::npos && token.substr(b, e - b + 1) == day_str) {
+                                today = true;
+                                break;
+                            }
+                            pos = (comma == std::string::npos) ? list.size() : comma + 1;
+                        }
+                    }
+                    if (!today)
+                        continue;
+                }
                 bool exists = false;
                 cJSON* elem = nullptr;
-                cJSON_ArrayForEach(elem, doses) {
+                cJSON_ArrayForEach (elem, doses) {
                     cJSON* dmed = cJSON_GetObjectItem(elem, "medicine");
                     cJSON* dplanned = cJSON_GetObjectItem(elem, "planned");
                     if (dmed && cJSON_IsString(dmed) && dplanned && cJSON_IsString(dplanned) &&
@@ -1672,20 +1796,21 @@ private:
                 }
             }
         }
-        if (plans) cJSON_Delete(plans);
+        if (plans)
+            cJSON_Delete(plans);
         if (changed) {
             StoreJson(settings, "medication_task", key.c_str(), doses);
         }
 
         // 2. 清理过期记录（保留 CONFIG_MEDICATION_LOG_KEEP_DAYS 天）
-        for (int age = CONFIG_MEDICATION_LOG_KEEP_DAYS;
-             age <= CONFIG_MEDICATION_LOG_KEEP_DAYS + 2; age++) {
+        for (int age = CONFIG_MEDICATION_LOG_KEEP_DAYS; age <= CONFIG_MEDICATION_LOG_KEEP_DAYS + 2;
+             age++) {
             settings.EraseKey(MedicationDoseKey(now - age * 86400));
         }
 
         // 3. 逐条推进状态机
         cJSON* elem = nullptr;
-        cJSON_ArrayForEach(elem, doses) {
+        cJSON_ArrayForEach (elem, doses) {
             cJSON* st = cJSON_GetObjectItem(elem, "status");
             cJSON* planned = cJSON_GetObjectItem(elem, "planned");
             cJSON* med = cJSON_GetObjectItem(elem, "medicine");
@@ -1708,8 +1833,7 @@ private:
             if (delta >= CONFIG_MEDICATION_MISSED_TIMEOUT_MIN) {
                 // 超时未打卡 -> 漏服
                 cJSON_ReplaceItemInObject(elem, "status", cJSON_CreateString("missed"));
-                cJSON_ReplaceItemInObject(elem, "delay",
-                                          cJSON_CreateNumber(delta));
+                cJSON_ReplaceItemInObject(elem, "delay", cJSON_CreateNumber(delta));
                 StoreJson(settings, "medication_task", key.c_str(), doses);
                 ESP_LOGW(TAG, "medication: MISSED %s planned=%s", medicine.c_str(),
                          planned_hm.c_str());
@@ -1723,11 +1847,10 @@ private:
                 expected = CONFIG_MEDICATION_REMIND_MAX_TIMES;
             }
             cJSON* reminds_item = cJSON_GetObjectItem(elem, "reminds");
-            int reminds = (reminds_item && cJSON_IsNumber(reminds_item))
-                              ? reminds_item->valueint : 0;
+            int reminds =
+                (reminds_item && cJSON_IsNumber(reminds_item)) ? reminds_item->valueint : 0;
             if (reminds < expected) {
-                cJSON_ReplaceItemInObject(elem, "reminds",
-                                          cJSON_CreateNumber(expected));
+                cJSON_ReplaceItemInObject(elem, "reminds", cJSON_CreateNumber(expected));
                 StoreJson(settings, "medication_task", key.c_str(), doses);
                 ESP_LOGI(TAG, "medication: remind #%d for %s planned=%s", expected,
                          medicine.c_str(), planned_hm.c_str());
@@ -1745,14 +1868,12 @@ private:
         args.name = "med_rem";
         esp_err_t err = esp_timer_create(&args, &medication_timer_);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "medication_reminder: create timer failed: %s",
-                     esp_err_to_name(err));
+            ESP_LOGE(TAG, "medication_reminder: create timer failed: %s", esp_err_to_name(err));
             return;
         }
         err = esp_timer_start_periodic(medication_timer_, 60 * 1000 * 1000);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "medication_reminder: start timer failed: %s",
-                     esp_err_to_name(err));
+            ESP_LOGE(TAG, "medication_reminder: start timer failed: %s", esp_err_to_name(err));
             return;
         }
         ESP_LOGI(TAG, "medication_reminder: timer started, checking every 60s");
@@ -1819,7 +1940,8 @@ private:
         if (envelope != nullptr) {
             cJSON* text_item = cJSON_GetObjectItem(envelope, "text");
             model_text = (text_item != nullptr && cJSON_IsString(text_item))
-                             ? text_item->valuestring : *result;
+                             ? text_item->valuestring
+                             : *result;
             cJSON_Delete(envelope);
         } else {
             model_text = *result;
@@ -1838,9 +1960,8 @@ private:
         }
         if (sedentary) {
             ESP_LOGW(TAG, "sedentary_reminder: person inactive, reminding");
-            Application::GetInstance().Schedule([]() {
-                ShowElderAlert("温馨提醒", "您已经坐了很久了，起来活动活动吧！", "info");
-            });
+            Application::GetInstance().Schedule(
+                []() { ShowElderAlert("温馨提醒", "您已经坐了很久了，起来活动活动吧！", "info"); });
         }
     }
 
@@ -1855,8 +1976,8 @@ private:
             ESP_LOGE(TAG, "sedentary: create timer failed: %s", esp_err_to_name(err));
             return;
         }
-        err = esp_timer_start_periodic(
-            sedentary_timer_, CONFIG_SEDENTARY_REMINDER_PERIOD_MS * 1000);
+        err =
+            esp_timer_start_periodic(sedentary_timer_, CONFIG_SEDENTARY_REMINDER_PERIOD_MS * 1000);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "sedentary: start timer failed: %s", esp_err_to_name(err));
             return;
@@ -1929,7 +2050,8 @@ private:
         if (envelope != nullptr) {
             cJSON* text_item = cJSON_GetObjectItem(envelope, "text");
             model_text = (text_item != nullptr && cJSON_IsString(text_item))
-                             ? text_item->valuestring : *result;
+                             ? text_item->valuestring
+                             : *result;
             cJSON_Delete(envelope);
         } else {
             model_text = *result;
@@ -1954,14 +2076,13 @@ private:
         } else {
             bed_empty_count_++;
             ESP_LOGI(TAG, "bed_exit: bed empty, count=%d", bed_empty_count_);
-            int threshold = CONFIG_BED_EXIT_EMPTY_TIMEOUT_S * 1000 /
-                            CONFIG_BED_EXIT_CHECK_PERIOD_MS;
+            int threshold =
+                CONFIG_BED_EXIT_EMPTY_TIMEOUT_S * 1000 / CONFIG_BED_EXIT_CHECK_PERIOD_MS;
             if (bed_empty_count_ >= threshold) {
                 ESP_LOGW(TAG, "bed_exit: bed empty too long, alerting!");
                 bed_empty_count_ = 0;
                 Application::GetInstance().Schedule([]() {
-                    ShowElderAlert("离床告警",
-                                   "老人已离床较长时间未返回，请确认是否安全。",
+                    ShowElderAlert("离床告警", "老人已离床较长时间未返回，请确认是否安全。",
                                    "warning");
                     Application::GetInstance().SendMcpMessage(
                         "{\"type\":\"bed_exit_alert\",\"source\":\"device\"}");
@@ -1981,8 +2102,7 @@ private:
             ESP_LOGE(TAG, "bed_exit: create timer failed: %s", esp_err_to_name(err));
             return;
         }
-        err = esp_timer_start_periodic(
-            bed_exit_timer_, CONFIG_BED_EXIT_CHECK_PERIOD_MS * 1000);
+        err = esp_timer_start_periodic(bed_exit_timer_, CONFIG_BED_EXIT_CHECK_PERIOD_MS * 1000);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "bed_exit: start timer failed: %s", esp_err_to_name(err));
             return;
@@ -1992,10 +2112,560 @@ private:
     }
 #endif  // CONFIG_ENABLE_BED_EXIT_DETECTION
 
+#ifdef CONFIG_ENABLE_CARE_SYNC
+    // ====================================================================
+    // 关怀云端同步：与服务端老年关怀模块 REST 接口双向同步
+    // --------------------------------------------------------------------
+    // 服务端接口（/api/device/care/*，Device-Id=MAC 鉴权，无需登录态）：
+    //   GET  /api/device/care/profile      老人档案（姓名/健康备注）
+    //   GET  /api/device/care/plan         启用中的服药计划（云端为准）
+    //   POST /api/device/care/plan         新增计划（设备语音设置上报）
+    //   DEL  /api/device/care/plan/{id}    删除计划
+    //   POST /api/device/care/plan/taken   上报已服药（msgId 幂等）
+    //   GET  /api/device/care/messages     拉取关怀留言（代替 MQTT 订阅）
+    //
+    // 服务端地址从 OTA URL 推导（同主机同端口）：ota_url 末尾去掉
+    // /api/device/ota 即得 base。局域网无 DNS 变更时无需额外配置。
+    //
+    // 数据一致性策略：
+    //   - 带 planId 的计划：云端为准（每次同步整体刷新）
+    //   - 不带 planId 的本地计划（语音设置时云端不可达）：保留，
+    //     下轮同步时补推云端并回填 planId（自愈）
+    //   - 打卡/留言按 msgId 幂等，重复请求不会产生重复记录
+    // ====================================================================
+
+    // 服务端 base URL，结果缓存（OTA URL 运行期不变）
+    static std::string CareApiBase() {
+        static std::string cached;
+        static bool resolved = false;
+        if (resolved) {
+            return cached;
+        }
+        resolved = true;
+#ifdef CONFIG_CARE_API_BASE
+        if (strlen(CONFIG_CARE_API_BASE) > 0) {
+            cached = CONFIG_CARE_API_BASE;
+            ESP_LOGI(TAG, "care_sync: api base = %s (from CONFIG_CARE_API_BASE)", cached.c_str());
+            return cached;
+        }
+#endif
+        Settings settings("wifi", false);
+        std::string url = settings.GetString("ota_url");
+        if (url.empty()) {
+            url = CONFIG_OTA_URL;
+        }
+        const std::string suffix = "/api/device/ota";
+        if (url.size() > suffix.size() &&
+            url.compare(url.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            cached = url.substr(0, url.size() - suffix.size());
+        } else {
+            // 兜底：scheme://host[:port]/... -> scheme://host[:port]
+            cached = url;
+            size_t scheme_end = cached.find("://");
+            size_t path = (scheme_end == std::string::npos) ? std::string::npos
+                                                            : cached.find('/', scheme_end + 3);
+            if (path != std::string::npos) {
+                cached = cached.substr(0, path);
+            }
+        }
+        ESP_LOGI(TAG, "care_sync: api base = %s", cached.c_str());
+        return cached;
+    }
+
+    // 统一 HTTP 响应解包：{code:200, data:...} -> data（调用方负责释放）
+    static cJSON* CareUnwrap(cJSON* envelope) {
+        if (envelope == nullptr) {
+            return nullptr;
+        }
+        cJSON* code = cJSON_GetObjectItem(envelope, "code");
+        if (!cJSON_IsNumber(code) || code->valueint != 200) {
+            cJSON_Delete(envelope);
+            return nullptr;
+        }
+        cJSON* data = cJSON_GetObjectItem(envelope, "data");
+        if (data == nullptr) {
+            cJSON_Delete(envelope);
+            return nullptr;
+        }
+        cJSON* detached = cJSON_DetachItemViaPointer(envelope, data);
+        cJSON_Delete(envelope);
+        return detached;
+    }
+
+    // GET {base}{path}，返回 data 部分（无数据/失败返回 nullptr）
+    static cJSON* CareGetJson(const char* path) {
+        auto network = Board::GetInstance().GetNetwork();
+        if (network == nullptr) {
+            return nullptr;
+        }
+        auto http = network->CreateHttp(10);
+        if (http == nullptr) {
+            return nullptr;
+        }
+        http->SetHeader("Device-Id", SystemInfo::GetMacAddress());
+        auto opened = http->Open("GET", CareApiBase() + path);
+        if (!opened) {
+            ESP_LOGW(TAG, "care_sync: GET %s failed: %s", path, opened.error().ToString().c_str());
+            http->Close();
+            return nullptr;
+        }
+        auto status = http->GetStatusCode();
+        if (!status || *status != 200) {
+            ESP_LOGW(TAG, "care_sync: GET %s -> HTTP %d", path, status ? *status : -1);
+            http->Close();
+            return nullptr;
+        }
+        std::string body = http->ReadAll();
+        http->Close();
+        return CareUnwrap(cJSON_Parse(body.c_str()));
+    }
+
+    // POST/DELETE JSON body，envelope code==200 视为成功
+    static bool CareSendJson(const char* method, const char* path, cJSON* body) {
+        auto network = Board::GetInstance().GetNetwork();
+        if (network == nullptr) {
+            return false;
+        }
+        auto http = network->CreateHttp(10);
+        if (http == nullptr) {
+            return false;
+        }
+        http->SetHeader("Device-Id", SystemInfo::GetMacAddress());
+        http->SetHeader("Content-Type", "application/json");
+        char* out = cJSON_PrintUnformatted(body);
+        std::string content = (out != nullptr) ? out : "{}";
+        free(out);
+        http->SetContent(std::move(content));
+        auto opened = http->Open(method, CareApiBase() + path);
+        if (!opened) {
+            ESP_LOGW(TAG, "care_sync: %s %s failed: %s", method, path,
+                     opened.error().ToString().c_str());
+            http->Close();
+            return false;
+        }
+        auto status = http->GetStatusCode();
+        std::string resp = http->ReadAll();
+        http->Close();
+        if (!status || *status != 200) {
+            ESP_LOGW(TAG, "care_sync: %s %s -> HTTP %d", method, path, status ? *status : -1);
+            return false;
+        }
+        cJSON* envelope = cJSON_Parse(resp.c_str());
+        bool ok = (envelope != nullptr);
+        cJSON_Delete(envelope);
+        return ok;
+    }
+
+    // 上报一条服药计划到云端，成功时回填 planId（静态：MCP 回调是无捕获 lambda）
+    static bool CarePushPlan(const char* medicine, const char* take_time, std::string* plan_id) {
+        cJSON* body = cJSON_CreateObject();
+        cJSON_AddStringToObject(body, "medicine", medicine);
+        cJSON_AddStringToObject(body, "takeTime", take_time);
+        cJSON_AddStringToObject(body, "repeatRule", "daily");
+        auto network = Board::GetInstance().GetNetwork();
+        if (network == nullptr) {
+            cJSON_Delete(body);
+            return false;
+        }
+        auto http = network->CreateHttp(10);
+        if (http == nullptr) {
+            cJSON_Delete(body);
+            return false;
+        }
+        http->SetHeader("Device-Id", SystemInfo::GetMacAddress());
+        http->SetHeader("Content-Type", "application/json");
+        char* out = cJSON_PrintUnformatted(body);
+        std::string content = (out != nullptr) ? out : "{}";
+        free(out);
+        cJSON_Delete(body);
+        http->SetContent(std::move(content));
+        auto opened = http->Open("POST", CareApiBase() + "/api/device/care/plan");
+        if (!opened) {
+            http->Close();
+            return false;
+        }
+        auto status = http->GetStatusCode();
+        std::string resp = http->ReadAll();
+        http->Close();
+        if (!status || *status != 200) {
+            ESP_LOGW(TAG, "care_sync: push plan -> HTTP %d", status ? *status : -1);
+            return false;
+        }
+        cJSON* data = CareUnwrap(cJSON_Parse(resp.c_str()));
+        if (data == nullptr) {
+            return false;
+        }
+        cJSON* pid = cJSON_GetObjectItem(data, "planId");
+        if (plan_id != nullptr && cJSON_IsString(pid)) {
+            *plan_id = pid->valuestring;
+        }
+        cJSON_Delete(data);
+        return true;
+    }
+
+    // 删除云端计划；200=已删除，404=云端本就不存在（care_sync 可能已按"云端为准"
+    // 清理过），均视为成功
+    static bool CareDeletePlan(const std::string& plan_id) {
+        auto network = Board::GetInstance().GetNetwork();
+        if (network == nullptr) {
+            return false;
+        }
+        auto http = network->CreateHttp(10);
+        if (http == nullptr) {
+            return false;
+        }
+        http->SetHeader("Device-Id", SystemInfo::GetMacAddress());
+        auto opened = http->Open("DELETE", CareApiBase() + "/api/device/care/plan/" + plan_id);
+        if (!opened) {
+            http->Close();
+            return false;
+        }
+        auto status = http->GetStatusCode();
+        http->ReadAll();
+        http->Close();
+        return status && (*status == 200 || *status == 404);
+    }
+
+    // 待删除对账队列（tombstone）：本地已删但云端尚未确认删除的 planId。
+    // 持久化到 NVS 跨重启兜底；care_sync 每拍对账重试，成功或确认云端已无后清除。
+    // 上限 16 条，超出丢弃最旧记录。
+    static constexpr size_t kMaxPendingDeletes = 16;
+
+    static std::vector<std::string> LoadPendingDeletes() {
+        std::vector<std::string> ids;
+        Settings settings("medication", true);
+        cJSON* arr = cJSON_Parse(settings.GetString("pending_deletes", "[]").c_str());
+        if (arr != nullptr && cJSON_IsArray(arr)) {
+            cJSON* e = nullptr;
+            cJSON_ArrayForEach (e, arr) {
+                if (cJSON_IsString(e) && e->valuestring[0] != '\0') {
+                    ids.emplace_back(e->valuestring);
+                }
+            }
+        }
+        cJSON_Delete(arr);
+        return ids;
+    }
+
+    static void SavePendingDeletes(const std::vector<std::string>& ids) {
+        cJSON* arr = cJSON_CreateArray();
+        size_t start = ids.size() > kMaxPendingDeletes ? ids.size() - kMaxPendingDeletes : 0;
+        for (size_t i = start; i < ids.size(); ++i) {
+            cJSON_AddItemToArray(arr, cJSON_CreateString(ids[i].c_str()));
+        }
+        char* out = cJSON_PrintUnformatted(arr);
+        Settings settings("medication", true);
+        settings.SetString("pending_deletes", out != nullptr ? out : "[]");
+        free(out);
+        cJSON_Delete(arr);
+    }
+
+    static void AddPendingDelete(const std::string& plan_id) {
+        auto ids = LoadPendingDeletes();
+        for (const auto& id : ids) {
+            if (id == plan_id) {
+                return;  // 幂等：已记录不重复
+            }
+        }
+        ids.emplace_back(plan_id);
+        SavePendingDeletes(ids);
+    }
+
+    static void RemovePendingDelete(const std::string& plan_id) {
+        auto ids = LoadPendingDeletes();
+        for (auto it = ids.begin(); it != ids.end(); ++it) {
+            if (*it == plan_id) {
+                ids.erase(it);
+                SavePendingDeletes(ids);
+                return;
+            }
+        }
+    }
+
+    // 上报服药打卡（云端按 msgId 幂等：每天每药最多一条记录）
+    // 静态：MCP 回调是无捕获 lambda
+    static void CareReportTaken(const std::string& medicine, time_t now) {
+        char day[16] = {0};
+        strftime(day, sizeof(day), "%Y%m%d", localtime(&now));
+        cJSON* body = cJSON_CreateObject();
+        cJSON_AddStringToObject(body, "medicine", medicine.c_str());
+        std::string msg_id = std::string("chk-") + day + "-" + medicine;
+        cJSON_AddStringToObject(body, "msgId", msg_id.c_str());
+        if (CareSendJson("POST", "/api/device/care/plan/taken", body)) {
+            ESP_LOGI(TAG, "care_sync: taken reported (%s)", msg_id.c_str());
+        } else {
+            ESP_LOGW(TAG, "care_sync: taken report failed (%s)", msg_id.c_str());
+        }
+        cJSON_Delete(body);
+    }
+
+    // 拉取云端启用中的服药计划，与本地 NVS 合并：
+    // 带 planId 的条目以云端为准；本地无 planId 条目保留并补推云端
+    void SyncMedicationPlansFromCloud() {
+        cJSON* server_plans = CareGetJson("/api/device/care/plan");
+        if (server_plans == nullptr || !cJSON_IsArray(server_plans)) {
+            if (server_plans != nullptr)
+                cJSON_Delete(server_plans);
+            ESP_LOGW(TAG, "care_sync: fetch plans failed, keep local data");
+            return;
+        }
+
+        Settings settings("medication", true);
+        cJSON* local = cJSON_Parse(settings.GetString("reminders", "[]").c_str());
+        if (local == nullptr || !cJSON_IsArray(local)) {
+            if (local != nullptr)
+                cJSON_Delete(local);
+            local = cJSON_CreateArray();
+        }
+
+        // 云端计划归一化为本地格式 {time, medicine, planId, rule, weekdays}
+        cJSON* cloud = cJSON_CreateArray();
+        cJSON* elem = nullptr;
+        cJSON_ArrayForEach (elem, server_plans) {
+            cJSON* pid = cJSON_GetObjectItem(elem, "planId");
+            cJSON* med = cJSON_GetObjectItem(elem, "medicine");
+            cJSON* tt = cJSON_GetObjectItem(elem, "takeTime");
+            if (!cJSON_IsString(pid) || !cJSON_IsString(med) || !cJSON_IsString(tt)) {
+                continue;
+            }
+            cJSON* item = cJSON_CreateObject();
+            std::string take = tt->valuestring;  // "HH:MM:SS" -> "HH:MM"
+            if (take.size() >= 5) {
+                take = take.substr(0, 5);
+            }
+            cJSON_AddStringToObject(item, "time", take.c_str());
+            cJSON_AddStringToObject(item, "medicine", med->valuestring);
+            cJSON_AddStringToObject(item, "planId", pid->valuestring);
+            cJSON* rule = cJSON_GetObjectItem(elem, "repeatRule");
+            cJSON_AddStringToObject(item, "rule",
+                                    (rule && cJSON_IsString(rule)) ? rule->valuestring : "daily");
+            cJSON* wd = cJSON_GetObjectItem(elem, "weekdays");
+            if (wd && cJSON_IsString(wd) && wd->valuestring[0] != '\0') {
+                cJSON_AddStringToObject(item, "weekdays", wd->valuestring);
+            }
+            cJSON_AddItemToArray(cloud, item);
+        }
+        cJSON_Delete(server_plans);
+
+        // 本地删除对账：tombstone 里的 planId 若云端仍存在则重发 DELETE。
+        // 成功 -> 从云端列表剔除（阻止本轮 merge 复活）并清除 tombstone；
+        // 失败 -> 保留 tombstone 下拍重试，本轮仍按云端为准合并。
+        auto pending = LoadPendingDeletes();
+        if (!pending.empty()) {
+            std::vector<std::string> still_pending;
+            for (const auto& pid : pending) {
+                bool in_cloud = false;
+                cJSON* ce = nullptr;
+                cJSON_ArrayForEach (ce, cloud) {
+                    cJSON* p = cJSON_GetObjectItem(ce, "planId");
+                    if (p != nullptr && cJSON_IsString(p) && pid == p->valuestring) {
+                        in_cloud = true;
+                        break;
+                    }
+                }
+                if (!in_cloud) {
+                    continue;  // 云端已无此计划，对账完成
+                }
+                if (CareDeletePlan(pid)) {
+                    ESP_LOGI(TAG, "care_sync: pending delete done (%s)", pid.c_str());
+                    cJSON_ArrayForEach (ce, cloud) {
+                        cJSON* p = cJSON_GetObjectItem(ce, "planId");
+                        if (p != nullptr && cJSON_IsString(p) && pid == p->valuestring) {
+                            UnlinkAndDeleteItem(cloud, ce);
+                            break;
+                        }
+                    }
+                } else {
+                    still_pending.emplace_back(pid);
+                    ESP_LOGW(TAG, "care_sync: pending delete retry next cycle (%s)", pid.c_str());
+                }
+            }
+            SavePendingDeletes(still_pending);
+        }
+
+        // 保留本地计划（无 planId），并尝试补推云端实现自愈
+        cJSON* merged = cJSON_CreateArray();
+        cJSON* local_elem = nullptr;
+        cJSON_ArrayForEach (local_elem, local) {
+            cJSON* pid = cJSON_GetObjectItem(local_elem, "planId");
+            if (pid != nullptr && cJSON_IsString(pid)) {
+                continue;  // 已同步的计划以云端为准
+            }
+            cJSON* med = cJSON_GetObjectItem(local_elem, "medicine");
+            cJSON* tm = cJSON_GetObjectItem(local_elem, "time");
+            if (cJSON_IsString(med) && cJSON_IsString(tm)) {
+                std::string new_plan_id;
+                if (CarePushPlan(med->valuestring, tm->valuestring, &new_plan_id)) {
+                    cJSON_AddStringToObject(local_elem, "planId", new_plan_id.c_str());
+                    ESP_LOGI(TAG, "care_sync: local plan pushed (%s %s)", med->valuestring,
+                             tm->valuestring);
+                }
+            }
+            cJSON_AddItemToArray(merged, cJSON_Duplicate(local_elem, 1));
+        }
+        cJSON_ArrayForEach (elem, cloud) {
+            cJSON_AddItemToArray(merged, cJSON_Duplicate(elem, 1));
+        }
+
+        // 内容有变化才写 NVS，减少无谓的磨损
+        char* merged_str = cJSON_PrintUnformatted(merged);
+        if (merged_str == nullptr) {
+            ESP_LOGE(TAG, "care_sync: serialize merged plans failed");
+        } else {
+            std::string stored_old = settings.GetString("reminders", "[]");
+            if (stored_old != merged_str) {
+                settings.SetString("reminders", merged_str);
+                ESP_LOGI(TAG, "care_sync: plans updated, local=%d merged=%d",
+                         cJSON_GetArraySize(local), cJSON_GetArraySize(merged));
+            }
+            free(merged_str);
+        }
+        cJSON_Delete(merged);
+        cJSON_Delete(local);
+        cJSON_Delete(cloud);
+    }
+
+    // 拉取家属关怀留言，追加到留言板（按 msgId 幂等去重）
+    void PullCareMessages() {
+        cJSON* msgs = CareGetJson("/api/device/care/messages");
+        if (msgs == nullptr || !cJSON_IsArray(msgs)) {
+            if (msgs != nullptr)
+                cJSON_Delete(msgs);
+            return;  // 无留言或拉取失败，静默
+        }
+
+        Settings settings("voice_board", true);
+        cJSON* board = cJSON_Parse(settings.GetString("messages", "[]").c_str());
+        if (board == nullptr || !cJSON_IsArray(board)) {
+            if (board != nullptr)
+                cJSON_Delete(board);
+            board = cJSON_CreateArray();
+        }
+        cJSON* seen = cJSON_Parse(settings.GetString("seen", "[]").c_str());
+        if (seen == nullptr || !cJSON_IsArray(seen)) {
+            if (seen != nullptr)
+                cJSON_Delete(seen);
+            seen = cJSON_CreateArray();
+        }
+
+        auto seen_has = [&seen](const char* id) -> bool {
+            cJSON* e = nullptr;
+            cJSON_ArrayForEach (e, seen) {
+                if (cJSON_IsString(e) && strcmp(e->valuestring, id) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        time_t now = time(nullptr);
+        bool board_changed = false;
+        cJSON* elem = nullptr;
+        cJSON_ArrayForEach (elem, msgs) {
+            cJSON* mid = cJSON_GetObjectItem(elem, "msgId");
+            cJSON* text = cJSON_GetObjectItem(elem, "text");
+            cJSON* sender = cJSON_GetObjectItem(elem, "sender");
+            cJSON* tstr = cJSON_GetObjectItem(elem, "time");
+            if (!cJSON_IsString(mid) || !cJSON_IsString(text) || text->valuestring[0] == '\0') {
+                continue;
+            }
+            if (seen_has(mid->valuestring)) {
+                continue;
+            }
+            cJSON* item = cJSON_CreateObject();
+            cJSON_AddStringToObject(item, "sender",
+                                    (sender && cJSON_IsString(sender) && sender->valuestring[0])
+                                        ? sender->valuestring
+                                        : "家人");
+            cJSON_AddStringToObject(item, "message", text->valuestring);
+            std::string when = (tstr && cJSON_IsString(tstr)) ? tstr->valuestring : "";
+            if (when.size() >= 16) {
+                when = when.substr(0, 16).replace(10, 1, " ");  // "T" -> " "
+            } else {
+                char buf[32] = {0};
+                strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", localtime(&now));
+                when = buf;
+            }
+            cJSON_AddStringToObject(item, "time", when.c_str());
+            cJSON_AddNumberToObject(item, "epoch", (double)now);
+            cJSON_AddItemToArray(board, item);
+            cJSON_AddItemToArray(seen, cJSON_CreateString(mid->valuestring));
+            board_changed = true;
+            ESP_LOGI(TAG, "care_sync: message from %s: %s",
+                     cJSON_GetObjectItem(item, "sender")->valuestring, text->valuestring);
+        }
+
+        // seen 去重集合封顶 100 条，防止无限增长
+        while (cJSON_GetArraySize(seen) > 100) {
+            cJSON* first = cJSON_GetArrayItem(seen, 0);
+            UnlinkAndDeleteItem(seen, first);
+        }
+        if (board_changed) {
+            PurgeExpiredVoiceMessages(board);
+            StoreJson(settings, "care_sync", "messages", board);
+        }
+        StoreJson(settings, "care_sync", "seen", seen);
+        cJSON_Delete(board);
+        cJSON_Delete(seen);
+        cJSON_Delete(msgs);
+    }
+
+    // 拉取老人档案（姓名/健康备注），SOS 告警会播报老人姓名
+    void PullElderProfile() {
+        cJSON* data = CareGetJson("/api/device/care/profile");
+        if (data == nullptr || !cJSON_IsObject(data)) {
+            if (data != nullptr)
+                cJSON_Delete(data);
+            return;
+        }
+        Settings settings("care", true);
+        cJSON* name = cJSON_GetObjectItem(data, "name");
+        if (name && cJSON_IsString(name) && name->valuestring[0]) {
+            settings.SetString("elder_name", name->valuestring);
+        }
+        cJSON* note = cJSON_GetObjectItem(data, "healthNote");
+        if (note && cJSON_IsString(note)) {
+            settings.SetString("health_note", note->valuestring);
+        }
+        cJSON_Delete(data);
+        ESP_LOGI(TAG, "care_sync: elder profile updated");
+    }
+
+    void RunCareSyncOnce() {
+        PullElderProfile();
+        SyncMedicationPlansFromCloud();
+        PullCareMessages();
+    }
+
+    static void CareSyncTaskEntry(void* arg) {
+        auto* self = static_cast<CompactWifiBoardS3Cam*>(arg);
+        // 等待 OTA 检查和协议初始化完成（避免并发 HTTP 连接导致内存崩溃）
+        vTaskDelay(pdMS_TO_TICKS(60 * 1000));
+        while (true) {
+            // 仅在设备空闲时同步，避免对话中并发 HTTP 与 WebSocket 冲突
+            auto state = Application::GetInstance().GetDeviceState();
+            if (state == kDeviceStateIdle) {
+                self->RunCareSyncOnce();
+            } else {
+                ESP_LOGI(TAG, "care_sync: device busy (state=%d), skipping", state);
+            }
+            vTaskDelay(pdMS_TO_TICKS(CONFIG_CARE_SYNC_PERIOD_MINUTES * 60 * 1000));
+        }
+    }
+
+    void StartCareSync() {
+        BaseType_t ret = xTaskCreate(CareSyncTaskEntry, "care_sync", 8192, this, 1, nullptr);
+        if (ret != pdPASS) {
+            ESP_LOGE(TAG, "care_sync: failed to create task");
+            return;
+        }
+        ESP_LOGI(TAG, "care_sync: task started, period=%d min", CONFIG_CARE_SYNC_PERIOD_MINUTES);
+    }
+#endif  // CONFIG_ENABLE_CARE_SYNC
+
 public:
-    CompactWifiBoardS3Cam() :
-        boot_button_(BOOT_BUTTON_GPIO),
-        sos_button_(SOS_BUTTON_GPIO, false, 3000) {
+    CompactWifiBoardS3Cam()
+        : boot_button_(BOOT_BUTTON_GPIO), sos_button_(SOS_BUTTON_GPIO, false, 3000) {
         InitializeSpi();
         InitializeLcdDisplay();
         InitializeButtons();
@@ -2012,8 +2682,9 @@ public:
 #ifdef CONFIG_ENABLE_SCHEDULE_REMINDER
         StartScheduleReminder();
 #else
-        ESP_LOGW(TAG, "schedule_reminder: ENABLE_SCHEDULE_REMINDER is OFF, "
-                      "saved reminders will NOT fire");
+        ESP_LOGW(TAG,
+                 "schedule_reminder: ENABLE_SCHEDULE_REMINDER is OFF, "
+                 "saved reminders will NOT fire");
 #endif
 #ifdef CONFIG_ENABLE_MEDICATION_REMINDER_TASK
         StartMedicationReminder();
@@ -2023,6 +2694,9 @@ public:
 #endif
 #ifdef CONFIG_ENABLE_BED_EXIT_DETECTION
         StartBedExitDetection();
+#endif
+#ifdef CONFIG_ENABLE_CARE_SYNC
+        StartCareSync();
 #endif
     }
 
@@ -2034,17 +2708,18 @@ public:
     virtual AudioCodec* GetAudioCodec() override {
 #ifdef AUDIO_I2S_METHOD_SIMPLEX
         static NoAudioCodecSimplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_SPK_GPIO_BCLK, AUDIO_I2S_SPK_GPIO_LRCK, AUDIO_I2S_SPK_GPIO_DOUT, AUDIO_I2S_MIC_GPIO_SCK, AUDIO_I2S_MIC_GPIO_WS, AUDIO_I2S_MIC_GPIO_DIN);
+                                               AUDIO_I2S_SPK_GPIO_BCLK, AUDIO_I2S_SPK_GPIO_LRCK,
+                                               AUDIO_I2S_SPK_GPIO_DOUT, AUDIO_I2S_MIC_GPIO_SCK,
+                                               AUDIO_I2S_MIC_GPIO_WS, AUDIO_I2S_MIC_GPIO_DIN);
 #else
         static NoAudioCodecDuplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN);
+                                              AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS,
+                                              AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN);
 #endif
         return &audio_codec;
     }
 
-    virtual Display* GetDisplay() override {
-        return display_;
-    }
+    virtual Display* GetDisplay() override { return display_; }
 
     virtual Backlight* GetBacklight() override {
         if (DISPLAY_BACKLIGHT_PIN != GPIO_NUM_NC) {
@@ -2054,9 +2729,7 @@ public:
         return nullptr;
     }
 
-    virtual Camera* GetCamera() override {
-        return camera_;
-    }
+    virtual Camera* GetCamera() override { return camera_; }
 };
 
 DECLARE_BOARD(CompactWifiBoardS3Cam);
