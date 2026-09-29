@@ -978,8 +978,9 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
     }
     // Set the chat state to wake word detected
     protocol_->SendWakeWordDetected(wake_word);
-    // Play popup sound after state changes to listening
-    play_popup_on_listening_ = true;
+    // NOTE: do NOT set play_popup_on_listening_ here. The deferred-start popup
+    // path deadlocks the mic input when playback state races at wake
+    // (observed: 63s of deafness until server idle TTS re-enabled input).
     SetListeningMode(GetDefaultListeningMode());
 #else
     // Set flag to play popup sound after state changes to listening
