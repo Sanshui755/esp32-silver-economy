@@ -10,4 +10,7 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 idf_build_set_property(MINIMAL_BUILD ON)
 
 set(PROJECT_VER "2.5.0")
+# 导出 compile_commands.json 供 clangd 使用，提供系统头文件路径与编译参数，
+# 避免 IDE 中出现 stddef.h / float.h not found 等假报错
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 project(xiaozhi)
