@@ -39,10 +39,10 @@ CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1536
 
 # Care sync API base (local server, NOT api.tenclass.net)
-CONFIG_CARE_API_BASE="http://192.168.0.33:8091"
+CONFIG_CARE_API_BASE="http://192.168.86.21:8091"
 
 # OTA endpoint on local server (returns websocket config, not mqtt)
-CONFIG_OTA_URL="http://192.168.0.33:8091/api/device/ota/"
+CONFIG_OTA_URL="http://192.168.86.21:8091/api/device/ota/"
 
 # LVGL Graphics
 CONFIG_LV_USE_SNAPSHOT=y

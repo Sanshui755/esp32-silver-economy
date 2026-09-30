@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -501,6 +502,36 @@ private:
                                 ESP_LOGI(TAG, "medication_reminder: cloud synced (%s %s -> %s)",
                                          pair->second->c_str(), pair->first->c_str(),
                                          plan_id.c_str());
+                                // 把 planId 回填到本地条目：删除时才有 ID 可记
+                                // tombstone，否则云端删除无从对账。
+                                // 三个并发回填若互相覆盖，下一拍 care_sync 的
+                                // 匹配回填逻辑会自动补齐（自愈）。
+                                Settings settings("medication", true);
+                                cJSON* arr =
+                                    cJSON_Parse(settings.GetString("reminders", "[]").c_str());
+                                if (arr != nullptr && cJSON_IsArray(arr)) {
+                                    cJSON* el = nullptr;
+                                    cJSON_ArrayForEach (el, arr) {
+                                        cJSON* m = cJSON_GetObjectItem(el, "medicine");
+                                        cJSON* t2 = cJSON_GetObjectItem(el, "time");
+                                        cJSON* p = cJSON_GetObjectItem(el, "planId");
+                                        if (cJSON_IsString(m) && cJSON_IsString(t2) &&
+                                            pair->first->compare(m->valuestring) == 0 &&
+                                            pair->second->compare(t2->valuestring) == 0 &&
+                                            (p == nullptr || !cJSON_IsString(p) ||
+                                             p->valuestring[0] == '\0')) {
+                                            cJSON_AddStringToObject(el, "planId", plan_id.c_str());
+                                            if (!StoreJson(settings, "medication_reminder",
+                                                           "reminders", arr)) {
+                                                ESP_LOGW(TAG,
+                                                         "medication_reminder: stamp "
+                                                         "planId failed");
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    cJSON_Delete(arr);
+                                }
                             } else {
                                 ESP_LOGW(TAG, "medication_reminder: cloud sync failed (%s %s)",
                                          pair->second->c_str(), pair->first->c_str());
@@ -2483,28 +2514,98 @@ private:
             SavePendingDeletes(still_pending);
         }
 
-        // 保留本地计划（无 planId），并尝试补推云端实现自愈
+        // 合并策略（修复重复推送与 planId 丢失导致的"删除无法对账"）：
+        // 1) 本地已有 planId -> 直接并入
+        // 2) 本地无 planId -> 先按 药名+服药时间 匹配云端，命中则回填云端 planId
+        //    （不再重复 POST，避免一个计划多行孤儿）；未命中才 POST 新建
+        // 3) 云端剩余条目：planId 已被并入的跳过；与已并入计划同名同时间的重复
+        //    行（含本地为空时的云端内部重复批次孤儿）记入 tombstone 待删
+        std::set<std::string> covered;
+        std::set<std::string> seen_med_time;  // 已并入计划的 药名|时间 键，用于批次去重
+        auto med_time_key = [](const char* med, const char* tm) {
+            return std::string(med) + "|" + tm;
+        };
         cJSON* merged = cJSON_CreateArray();
         cJSON* local_elem = nullptr;
         cJSON_ArrayForEach (local_elem, local) {
             cJSON* pid = cJSON_GetObjectItem(local_elem, "planId");
-            if (pid != nullptr && cJSON_IsString(pid)) {
-                continue;  // 已同步的计划以云端为准
-            }
             cJSON* med = cJSON_GetObjectItem(local_elem, "medicine");
             cJSON* tm = cJSON_GetObjectItem(local_elem, "time");
-            if (cJSON_IsString(med) && cJSON_IsString(tm)) {
-                std::string new_plan_id;
-                if (CarePushPlan(med->valuestring, tm->valuestring, &new_plan_id)) {
-                    cJSON_AddStringToObject(local_elem, "planId", new_plan_id.c_str());
-                    ESP_LOGI(TAG, "care_sync: local plan pushed (%s %s)", med->valuestring,
-                             tm->valuestring);
+            const char* med_s = (med && cJSON_IsString(med)) ? med->valuestring : "";
+            const char* tm_s = (tm && cJSON_IsString(tm)) ? tm->valuestring : "";
+            if (pid != nullptr && cJSON_IsString(pid) && pid->valuestring[0] != '\0') {
+                covered.insert(pid->valuestring);
+                if (med_s[0] != '\0') {
+                    seen_med_time.insert(med_time_key(med_s, tm_s));
                 }
+                cJSON_AddItemToArray(merged, cJSON_Duplicate(local_elem, 1));
+                continue;  // 已同步的计划以云端为准
+            }
+            // 先尝试云端同名同时间的计划，回填其 planId
+            bool stamped = false;
+            cJSON* ce = nullptr;
+            cJSON_ArrayForEach (ce, cloud) {
+                cJSON* cpid = cJSON_GetObjectItem(ce, "planId");
+                cJSON* cmed = cJSON_GetObjectItem(ce, "medicine");
+                cJSON* ctm = cJSON_GetObjectItem(ce, "time");
+                if (!cJSON_IsString(cpid) || !cJSON_IsString(cmed) || !cJSON_IsString(ctm)) {
+                    continue;
+                }
+                if (covered.count(cpid->valuestring) > 0) {
+                    continue;
+                }
+                if (strcmp(med_s, cmed->valuestring) == 0 && strcmp(tm_s, ctm->valuestring) == 0) {
+                    cJSON_AddStringToObject(local_elem, "planId", cpid->valuestring);
+                    covered.insert(cpid->valuestring);
+                    ESP_LOGI(TAG, "care_sync: local plan matched cloud (%s -> %s)", med_s,
+                             cpid->valuestring);
+                    stamped = true;
+                    break;
+                }
+            }
+            if (!stamped && med_s[0] != '\0' && tm_s[0] != '\0') {
+                std::string new_plan_id;
+                if (CarePushPlan(med_s, tm_s, &new_plan_id)) {
+                    cJSON_AddStringToObject(local_elem, "planId", new_plan_id.c_str());
+                    covered.insert(new_plan_id);
+                    ESP_LOGI(TAG, "care_sync: local plan pushed (%s %s)", med_s, tm_s);
+                }
+            }
+            if (med_s[0] != '\0') {
+                seen_med_time.insert(med_time_key(med_s, tm_s));
             }
             cJSON_AddItemToArray(merged, cJSON_Duplicate(local_elem, 1));
         }
         cJSON_ArrayForEach (elem, cloud) {
+            cJSON* cpid = cJSON_GetObjectItem(elem, "planId");
+            cJSON* cmed = cJSON_GetObjectItem(elem, "medicine");
+            cJSON* ctm = cJSON_GetObjectItem(elem, "time");
+            if (cJSON_IsString(cpid) && covered.count(cpid->valuestring) > 0) {
+                continue;  // 已由本地条目表示
+            }
+            // 与已并入计划同名同时间的重复行（含云端批次内部孤儿）-> tombstone
+            bool dup = false;
+            if (cJSON_IsString(cmed) && cJSON_IsString(ctm)) {
+                std::string key = med_time_key(cmed->valuestring, ctm->valuestring);
+                if (seen_med_time.count(key) > 0) {
+                    dup = true;
+                }
+            }
+            if (dup) {
+                if (cJSON_IsString(cpid)) {
+                    AddPendingDelete(cpid->valuestring);
+                    ESP_LOGW(TAG, "care_sync: duplicate cloud row queued for delete (%s)",
+                             cpid->valuestring);
+                }
+                continue;
+            }
             cJSON_AddItemToArray(merged, cJSON_Duplicate(elem, 1));
+            if (cJSON_IsString(cpid)) {
+                covered.insert(cpid->valuestring);
+            }
+            if (cJSON_IsString(cmed) && cJSON_IsString(ctm)) {
+                seen_med_time.insert(med_time_key(cmed->valuestring, ctm->valuestring));
+            }
         }
 
         // 内容有变化才写 NVS，减少无谓的磨损
